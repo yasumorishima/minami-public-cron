@@ -1,6 +1,6 @@
 # minami-public-cron
 
-南高OB会サイト ([minami-baseball-ob](https://github.com/yasumorishima/minami-baseball-ob), private / 技術解説 (public): [minami-baseball-ob-docs](https://github.com/yasumorishima/minami-baseball-ob-docs)) の **public 化可胷な cron workflow** を分離した public repo。
+南高OB会サイト ([minami-baseball-ob](https://github.com/yasumorishima/minami-baseball-ob), private / 技術解説 (public): [minami-baseball-ob-docs](https://github.com/yasumorishima/minami-baseball-ob-docs)) の **public 化可能な cron workflow** を分離した public repo。
 
 ## Purpose
 
@@ -26,7 +26,7 @@
 
 Settings → Secrets and variables → Actions → New repository secret から設定。 value は minami private repo の同名 secret と同じ。
 
-## What''s NOT here
+## What's NOT here
 
 - ❌ OB 名簿 / 会員情報 / Supabase auth code
 - ❌ 写真 / 名前 / 個人情報
