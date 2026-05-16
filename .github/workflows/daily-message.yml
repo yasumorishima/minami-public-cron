@@ -1,0 +1,132 @@
+name: Daily Message
+
+on:
+  schedule:
+    - cron: '0 21 * * *'   # JST 06:00 → morning
+    - cron: '0 3 * * *'    # JST 12:00 → noon
+    - cron: '0 9 * * *'    # JST 18:00 → night
+    - cron: '0 0 * * *'    # JST 09:00 → morning補完
+    - cron: '0 6 * * *'    # JST 15:00 → noon補完
+    - cron: '0 12 * * *'   # JST 21:00 → night補完
+  workflow_dispatch:
+    inputs:
+      slot:
+        description: "生成するスロット (morning/noon/night/all)"
+        required: true
+        type: choice
+        options:
+          - morning
+          - noon
+          - night
+          - all
+      memo:
+        description: "実行メモ"
+        required: false
+
+permissions: {}
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine slot
+        id: slot
+        env:
+          SLOT_INPUT: ${{ inputs.slot }}
+          CRON_SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          if [ -n "$SLOT_INPUT" ]; then
+            echo "value=$SLOT_INPUT" >> "$GITHUB_OUTPUT"
+            echo "is_backfill=false" >> "$GITHUB_OUTPUT"
+          else
+            # github.event.schedule でどのcronから発火したか判定
+            # （遅延実行されても正しいスロットが選ばれる）
+            # is_backfill=true は「最後の砦」cron（3h 後の補完）。失敗 → email。
+            # is_backfill=false は通常 cron。transient 失敗 → warning のみ（補完が拾う）
+            case "$CRON_SCHEDULE" in
+              "0 21 * * *") SLOT="morning"; BACKFILL=false ;;
+              "0 3 * * *")  SLOT="noon";    BACKFILL=false ;;
+              "0 9 * * *")  SLOT="night";   BACKFILL=false ;;
+              "0 0 * * *")  SLOT="morning"; BACKFILL=true  ;;
+              "0 6 * * *")  SLOT="noon";    BACKFILL=true  ;;
+              "0 12 * * *") SLOT="night";   BACKFILL=true  ;;
+              *)            SLOT="all";     BACKFILL=false ;;
+            esac
+            echo "value=$SLOT" >> "$GITHUB_OUTPUT"
+            echo "is_backfill=$BACKFILL" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate daily message
+        env:
+          IS_BACKFILL: ${{ steps.slot.outputs.is_backfill }}
+        run: |
+          SLOT="${{ steps.slot.outputs.value }}"
+          API_URL="${{ secrets.VERCEL_APP_URL }}/api/cron/daily-message"
+          AUTH="Authorization: Bearer ${{ secrets.CRON_SECRET }}"
+
+          # In-workflow retry: 3 attempts with 0s / 60s / 180s back-off (max ~4min).
+          # Captures transient Gemini 5xx without waiting for 3h backfill cron.
+          # Returns 0 on success (HTTP <400 or 429), 1 if all attempts fail.
+          # Sets LAST_HTTP_CODE for caller. 429 (rate limit) is treated as success
+          # because the API caller will be queued and retry on its own.
+          generate_with_retry() {
+            local target_slot=$1
+            local attempt wait_sec
+            for attempt in 1 2 3; do
+              if [ "$attempt" -gt 1 ]; then
+                case "$attempt" in
+                  2) wait_sec=60 ;;
+                  3) wait_sec=180 ;;
+                esac
+                echo "::notice::$target_slot retry attempt $attempt after ${wait_sec}s..."
+                sleep "$wait_sec"
+              fi
+              RESPONSE=$(curl -sS --max-time 90 -w "\n%{http_code}" "$API_URL?slot=$target_slot" -H "$AUTH")
+              HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+              BODY=$(echo "$RESPONSE" | sed '$d')
+              echo "[$target_slot attempt $attempt] HTTP $HTTP_CODE: $BODY"
+              LAST_HTTP_CODE=$HTTP_CODE
+              if [ "$HTTP_CODE" -lt 400 ] || [ "$HTTP_CODE" = "429" ]; then
+                echo "✅ $target_slot done (attempt $attempt)"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          if [ "$SLOT" = "all" ]; then
+            # 補完モード: 3スロット全部呼ぶ（API側の冪等性ガードで既存はスキップ）
+            echo "Running backfill for all slots..."
+            FAILED=0
+            for S in morning noon night; do
+              echo "--- $S ---"
+              if ! generate_with_retry "$S"; then
+                echo "::warning::$S failed after 3 attempts (last HTTP $LAST_HTTP_CODE)"
+                FAILED=$((FAILED + 1))
+              fi
+            done
+            if [ "$FAILED" -eq 3 ]; then
+              echo "::error::All slots failed after retries"
+              exit 1
+            fi
+          else
+            # 単一スロットモード（通常 cron / 補完 cron / workflow_dispatch）
+            echo "Generating $SLOT message... (is_backfill=$IS_BACKFILL)"
+            if ! generate_with_retry "$SLOT"; then
+              if [ "$IS_BACKFILL" = "true" ]; then
+                # 最後の砦が萼ちた = 本物の障害 → メール通知
+                echo "::error::Daily message generation failed ($SLOT, backfill) after 3 attempts (last HTTP $LAST_HTTP_CODE)"
+                exit 1
+              else
+                # 通常 cron は 3h 後の backfill が拾うので warning のみ（メール抑制）
+                echo "::warning::$SLOT failed after 3 attempts (last HTTP $LAST_HTTP_CODE) — backfill cron in 3h will retry"
+              fi
+            fi
+          fi
+
+      - name: Warm weather cache
+        # /weather を踏んで fetch Data Cache（10球場分）を refresh。
+        # 全天気表示（/weather / /schedule WeatherBadge / /schedule/[id] WeatherSection）が
+        # 同じ fetch URL を共有するので、これ1本で全ページのデータが fresh になる。
+        run: |
+          curl -sS -o /dev/null "${{ secrets.VERCEL_APP_URL }}/weather" || true
