@@ -1,6 +1,6 @@
 # minami-public-cron
 
-南高OB会サイト ([minami-baseball-ob](https://github.com/yasumorishima/minami-baseball-ob), private) の **public 化可胷な cron workflow** を分離した public repo。
+南高OB会サイト ([minami-baseball-ob](https://github.com/yasumorishima/minami-baseball-ob), private / 技術解説 (public): [minami-baseball-ob-docs](https://github.com/yasumorishima/minami-baseball-ob-docs)) の **public 化可胷な cron workflow** を分離した public repo。
 
 ## Purpose
 
