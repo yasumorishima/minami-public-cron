@@ -13,6 +13,7 @@
 | File | Schedule | 役割 |
 |---|---|---|
 | `warm-weather.yml` | `*/30 * * * *` | minami の `/weather` を HTTP GET で warm、 Vercel Data Cache を refresh |
+| `keep-alive.yml` | `0 0 * * 0` (週次) | `/schedule` を HTTP GET して SSR 経由で Supabase fetch を起こし、 Free plan の 7 日無活動 auto-pause を回避 (anon key 不要) |
 | `daily-message.yml` | 6 cron schedule | 「今日のひとこと」 API を call (morning/noon/night × 通常+補完) + /weather warm 補助 step |
 
 両方とも `runs-on: ubuntu-latest` で public 無料枠運用。
