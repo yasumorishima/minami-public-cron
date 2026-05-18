@@ -5,9 +5,9 @@ on:
     - cron: '0 21 * * *'   # JST 06:00 → morning
     - cron: '0 3 * * *'    # JST 12:00 → noon
     - cron: '0 9 * * *'    # JST 18:00 → night
-    - cron: '0 0 * * *'    # JST 09:00 → morning補完
-    - cron: '0 6 * * *'    # JST 15:00 → noon補完
-    - cron: '0 12 * * *'   # JST 21:00 → night補完
+    - cron: '0 22 * * *'   # JST 07:00 → morning補完 (本 cron の 1h 後)
+    - cron: '0 4 * * *'    # JST 13:00 → noon補完 (本 cron の 1h 後)
+    - cron: '0 10 * * *'   # JST 19:00 → night補完 (本 cron の 1h 後)
   workflow_dispatch:
     inputs:
       slot:
@@ -41,15 +41,15 @@ jobs:
           else
             # github.event.schedule でどのcronから発火したか判定
             # （遅延実行されても正しいスロットが選ばれる）
-            # is_backfill=true は「最後の砦」cron（3h 後の補完）。失敗 → email。
+            # is_backfill=true は「最後の砦」cron（1h 後の補完）。失敗 → email。
             # is_backfill=false は通常 cron。transient 失敗 → warning のみ（補完が拾う）
             case "$CRON_SCHEDULE" in
               "0 21 * * *") SLOT="morning"; BACKFILL=false ;;
               "0 3 * * *")  SLOT="noon";    BACKFILL=false ;;
               "0 9 * * *")  SLOT="night";   BACKFILL=false ;;
-              "0 0 * * *")  SLOT="morning"; BACKFILL=true  ;;
-              "0 6 * * *")  SLOT="noon";    BACKFILL=true  ;;
-              "0 12 * * *") SLOT="night";   BACKFILL=true  ;;
+              "0 22 * * *") SLOT="morning"; BACKFILL=true  ;;
+              "0 4 * * *")  SLOT="noon";    BACKFILL=true  ;;
+              "0 10 * * *") SLOT="night";   BACKFILL=true  ;;
               *)            SLOT="all";     BACKFILL=false ;;
             esac
             echo "value=$SLOT" >> "$GITHUB_OUTPUT"
@@ -65,7 +65,7 @@ jobs:
           AUTH="Authorization: Bearer ${{ secrets.CRON_SECRET }}"
 
           # In-workflow retry: 3 attempts with 0s / 60s / 180s back-off (max ~4min).
-          # Captures transient Gemini 5xx without waiting for 3h backfill cron.
+          # Captures transient Gemini 5xx without waiting for 1h backfill cron.
           # Returns 0 on success (HTTP <400 or 429), 1 if all attempts fail.
           # Sets LAST_HTTP_CODE for caller. 429 (rate limit) is treated as success
           # because the API caller will be queued and retry on its own.
@@ -118,8 +118,8 @@ jobs:
                 echo "::error::Daily message generation failed ($SLOT, backfill) after 3 attempts (last HTTP $LAST_HTTP_CODE)"
                 exit 1
               else
-                # 通常 cron は 3h 後の backfill が拾うので warning のみ（メール抑制）
-                echo "::warning::$SLOT failed after 3 attempts (last HTTP $LAST_HTTP_CODE) — backfill cron in 3h will retry"
+                # 通常 cron は 1h 後の backfill が拾うので warning のみ（メール抑制）
+                echo "::warning::$SLOT failed after 3 attempts (last HTTP $LAST_HTTP_CODE) — backfill cron in 1h will retry"
               fi
             fi
           fi
