@@ -1,0 +1,115 @@
+name: Update README Stats
+
+on:
+  schedule:
+    - cron: '0 0 1 * *'  # 毎月1日 UTC 0:00（JST 9:00）
+  workflow_dispatch:
+    inputs:
+      memo:
+        description: "実行メモ"
+        required: false
+
+permissions: {}
+
+jobs:
+  update-stats:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout cron repo (this repo for scripts/)
+        uses: actions/checkout@v4
+
+      - name: Checkout minami-baseball-ob (private)
+        uses: actions/checkout@v4
+        with:
+          repository: yasumorishima/minami-baseball-ob
+          token: ${{ secrets.DOCS_SYNC_PAT }}
+          path: ob-source
+
+      - name: Run stats script
+        id: stats
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: bash scripts/update-readme-stats.sh ./ob-source
+
+      - name: Sync README to minami-baseball-ob
+        env:
+          GH_TOKEN: ${{ secrets.DOCS_SYNC_PAT }}
+        run: |
+          cd ob-source
+          if git diff --quiet README.md; then
+            echo "No changes in minami-baseball-ob README"
+            exit 0
+          fi
+          ENCODED=$(base64 -w 0 < README.md)
+          SHA=$(gh api repos/yasumorishima/minami-baseball-ob/contents/README.md --jq '.sha')
+          gh api repos/yasumorishima/minami-baseball-ob/contents/README.md \
+            -X PUT \
+            -f message="docs: auto-update README stats" \
+            -f content="$ENCODED" \
+            -f sha="$SHA" \
+            --silent
+          echo "minami-baseball-ob README updated"
+
+      - name: Sync to docs repo (minami-baseball-ob-docs)
+        env:
+          GH_TOKEN: ${{ secrets.DOCS_SYNC_PAT }}
+        run: |
+          DOCS_RESP=$(gh api repos/yasumorishima/minami-baseball-ob-docs/contents/README.md)
+          echo "$DOCS_RESP" | jq -r '.content' | base64 -d > /tmp/docs-readme.md
+          SHA=$(echo "$DOCS_RESP" | jq -r '.sha')
+
+          for key in ts_files loc pages apis components tables_main tables_hist migrations workflows senseki; do
+            value=$(grep -oP "<!--stat:${key}-->\K[^<]*" ob-source/README.md | head -1)
+            if [ -n "$value" ]; then
+              sed -i "s/<!--stat:${key}-->[^<]*<!--\/stat-->/<!--stat:${key}-->${value}<!--\/stat-->/g" /tmp/docs-readme.md
+            fi
+          done
+
+          ENCODED=$(base64 -w 0 < /tmp/docs-readme.md)
+          gh api repos/yasumorishima/minami-baseball-ob-docs/contents/README.md \
+            -X PUT \
+            -f message="docs: auto-update README stats" \
+            -f content="$ENCODED" \
+            -f sha="$SHA" \
+            --silent
+          echo "docs repo README updated"
+
+      - name: Sync to profile repo (yasumorishima/yasumorishima)
+        env:
+          GH_TOKEN: ${{ secrets.DOCS_SYNC_PAT }}
+          STATS_PAGES: ${{ steps.stats.outputs.pages }}
+          STATS_TABLES_ALL: ${{ steps.stats.outputs.tables_all }}
+          STATS_E2E: ${{ steps.stats.outputs.e2e_tests }}
+          STATS_ACTIVE: ${{ steps.stats.outputs.active_users }}
+          STATS_COST: ${{ steps.stats.outputs.cost }}
+          STATS_TS: ${{ steps.stats.outputs.ts_files }}
+          STATS_LOC: ${{ steps.stats.outputs.loc }}
+        run: |
+          PROFILE_RESP=$(gh api repos/yasumorishima/yasumorishima/contents/README.md)
+          echo "$PROFILE_RESP" | jq -r '.content' | base64 -d > /tmp/profile-readme.md
+          SHA=$(echo "$PROFILE_RESP" | jq -r '.sha')
+
+          replace_ob() {
+            local key="$1" val="$2"
+            local val_esc
+            val_esc=$(printf '%s' "$val" | sed 's/[\/&]/\\&/g')
+            sed -i "s/<!--ob:${key}-->[^<]*<!--\/ob-->/<!--ob:${key}-->${val_esc}<!--\/ob-->/g" /tmp/profile-readme.md
+          }
+
+          replace_ob active_users "$STATS_ACTIVE"
+          replace_ob pages        "$STATS_PAGES"
+          replace_ob db_tables    "$STATS_TABLES_ALL"
+          replace_ob e2e_tests    "$STATS_E2E"
+          replace_ob cost         "$STATS_COST"
+          replace_ob ts_files     "$STATS_TS"
+          replace_ob loc          "$STATS_LOC"
+
+          ENCODED=$(base64 -w 0 < /tmp/profile-readme.md)
+          gh api repos/yasumorishima/yasumorishima/contents/README.md \
+            -X PUT \
+            -f message="docs: auto-update OB site stats" \
+            -f content="$ENCODED" \
+            -f sha="$SHA" \
+            --silent
+          echo "profile README updated"
