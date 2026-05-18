@@ -15,27 +15,33 @@ MIGRATIONS=$(ls supabase/migrations/*.sql 2>/dev/null | wc -l | tr -d ' ')
 WORKFLOWS=$(ls .github/workflows/*.yml 2>/dev/null | wc -l | tr -d ' ')
 E2E_TESTS=$(find e2e -name '*.spec.ts' 2>/dev/null | wc -l | tr -d ' ')
 
-# Supabase REST で計測 (history_matches / user_roles)
-if [ -n "${SUPABASE_URL:-}" ] && [ -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]; then
-  SENSEKI=$(curl --max-time 15 -fsS -I \
-    "$SUPABASE_URL/rest/v1/history_matches?select=id" \
+# Supabase REST で計測 (history_matches / user_roles) — HTTP code 明示 + max-time 60
+fetch_count() {
+  local table="$1" filter="${2:-}"
+  local url="$SUPABASE_URL/rest/v1/$table?select=id"
+  [ -n "$filter" ] && url="$url&$filter"
+  local resp http_code count
+  resp=$(curl --max-time 60 -sS -D - -o /dev/null -w 'HTTP_STATUS:%{http_code}\n' \
+    "$url" \
     -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
     -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
     -H "Prefer: count=exact" \
-    -H "Range: 0-0" 2>/dev/null \
-    | grep -i 'content-range:' | sed -E 's/.*\///' | tr -d '\r\n ' || echo 0)
-  [ -z "$SENSEKI" ] && SENSEKI=0
+    -H "Range: 0-0" 2>&1) || { echo "DEBUG $table curl failed" >&2; echo 0; return; }
+  http_code=$(printf '%s' "$resp" | grep '^HTTP_STATUS:' | sed 's/HTTP_STATUS://')
+  count=$(printf '%s' "$resp" | grep -i '^content-range:' | sed -E 's/.*\///' | tr -d '\r\n ')
+  echo "DEBUG $table http=$http_code count=$count" >&2
+  if [ -z "$count" ] || ! [[ "$count" =~ ^[0-9]+$ ]]; then
+    echo 0
+  else
+    echo "$count"
+  fi
+}
 
-  # user_roles where role != viewer (= admin / editor / member の合計)
-  ACTIVE_USERS=$(curl --max-time 15 -fsS -I \
-    "$SUPABASE_URL/rest/v1/user_roles?select=user_id&role=neq.viewer" \
-    -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
-    -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
-    -H "Prefer: count=exact" \
-    -H "Range: 0-0" 2>/dev/null \
-    | grep -i 'content-range:' | sed -E 's/.*\///' | tr -d '\r\n ' || echo 0)
-  [ -z "$ACTIVE_USERS" ] && ACTIVE_USERS=0
+if [ -n "${SUPABASE_URL:-}" ] && [ -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]; then
+  SENSEKI=$(fetch_count history_matches)
+  ACTIVE_USERS=$(fetch_count user_roles 'role=neq.viewer')
 else
+  echo "DEBUG SUPABASE secrets missing" >&2
   SENSEKI=0
   ACTIVE_USERS=0
 fi
