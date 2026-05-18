@@ -15,7 +15,8 @@ MIGRATIONS=$(ls supabase/migrations/*.sql 2>/dev/null | wc -l | tr -d ' ')
 WORKFLOWS=$(ls .github/workflows/*.yml 2>/dev/null | wc -l | tr -d ' ')
 E2E_TESTS=$(find e2e -name '*.spec.ts' 2>/dev/null | wc -l | tr -d ' ')
 
-# Supabase REST で計測 (history_matches / user_roles) — HTTP code 明示 + max-time 60
+# Supabase REST で計測 — 失敗時は KEEP 返却（呼出側で marker 更新 skip）
+# HTTP code 表示 + max-time 60 + non-2xx は KEEP
 fetch_count() {
   local table="$1" filter="${2:-}"
   local url="$SUPABASE_URL/rest/v1/$table?select=id"
@@ -26,12 +27,15 @@ fetch_count() {
     -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
     -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
     -H "Prefer: count=exact" \
-    -H "Range: 0-0" 2>&1) || { echo "DEBUG $table curl failed" >&2; echo 0; return; }
+    -H "Range: 0-0" 2>&1) || { echo "DEBUG $table curl failed" >&2; echo KEEP; return; }
   http_code=$(printf '%s' "$resp" | grep '^HTTP_STATUS:' | sed 's/HTTP_STATUS://')
   count=$(printf '%s' "$resp" | grep -i '^content-range:' | sed -E 's/.*\///' | tr -d '\r\n ')
   echo "DEBUG $table http=$http_code count=$count" >&2
-  if [ -z "$count" ] || ! [[ "$count" =~ ^[0-9]+$ ]]; then
-    echo 0
+  # HTTP 2xx かつ count が数値の場合のみ実値返却、それ以外は KEEP
+  if [ -z "$http_code" ] || [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+    echo KEEP
+  elif [ -z "$count" ] || ! [[ "$count" =~ ^[0-9]+$ ]]; then
+    echo KEEP
   else
     echo "$count"
   fi
@@ -42,8 +46,8 @@ if [ -n "${SUPABASE_URL:-}" ] && [ -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]; then
   ACTIVE_USERS=$(fetch_count user_roles 'role=neq.viewer')
 else
   echo "DEBUG SUPABASE secrets missing" >&2
-  SENSEKI=0
-  ACTIVE_USERS=0
+  SENSEKI=KEEP
+  ACTIVE_USERS=KEEP
 fi
 
 TS_FILES=$(find app components lib -name '*.ts' -o -name '*.tsx' | wc -l | tr -d ' ')
@@ -72,9 +76,13 @@ echo "workflows=$WORKFLOWS senseki=$SENSEKI ts_files=$TS_FILES loc=~$LOC_APPROX"
 echo "tables_main=$TABLES_MAIN tables_history=$TABLES_HISTORY tables_all=$TABLES_ALL"
 echo "e2e_tests=$E2E_TESTS active_users=$ACTIVE_USERS"
 
-# --- 置換関数 ---
+# --- 置換関数（KEEP の場合はスキップ）---
 replace_stat() {
   local key="$1" value="$2" file="$3"
+  if [ "$value" = "KEEP" ]; then
+    echo "  $key: KEEP (skip)"
+    return
+  fi
   sed -i "s/<!--stat:${key}-->[^<]*<!--\/stat-->/<!--stat:${key}-->${value}<!--\/stat-->/g" "$file"
 }
 
@@ -95,7 +103,7 @@ for readme in README.md; do
   echo "Updated $readme"
 done
 
-# --- GitHub Actions output (profile sync 用) ---
+# --- GitHub Actions output (profile sync 用、KEEP も含めて出力)---
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
   {
     echo "pages=$PAGES"
