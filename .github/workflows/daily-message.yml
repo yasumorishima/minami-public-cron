@@ -2,7 +2,7 @@ name: Daily Message
 
 on:
   schedule:
-    - cron: '*/30 * * * *'   # 30分おき polling、 JST 時刻から slot 自動判定
+    - cron: '*/30 * * * *'   # 30分おき polling: JST 時刻から slot 自動判定 (re-registered)
   workflow_dispatch:
     inputs:
       slot:
