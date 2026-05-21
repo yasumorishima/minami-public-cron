@@ -6,7 +6,7 @@
 
 - GitHub Actions の無料枠を public repo の unlimited 枠で消化、 private repo の quota 圧迫を回避
 - single point of failure (RPi5 self-hosted runner) からの脱却
-- RPi5 cron は defense-in-depth として並行稼働継続 (即削除しない、 例: keep-alive / daily-message は両側で動く設計)
+- RPi5 cron は defense-in-depth として並行稼働継続 (例: keep-alive)。 **daily-message は 2026-05-21 から public-cron 側が primary** (private repo の self-hosted 版は disabled)、 GHA scheduler 遅延 (noon 2h+ 遅延でサイト朝停滞事案) 対策で `*/30` polling に切替
 
 ## Workflows
 
@@ -14,7 +14,7 @@
 |---|---|---|
 | `warm-weather.yml` | `*/30 * * * *` | minami の `/weather` を HTTP GET で warm、 Vercel Data Cache を refresh |
 | `keep-alive.yml` | `0 0 * * 0` (週次) | `/schedule` を HTTP GET して SSR 経由で Supabase fetch を起こし、 Free plan の 7 日無活動 auto-pause を回避 (anon key 不要) |
-| `daily-message.yml` | 6 cron schedule | 「今日のひとこと」 API を call (morning/noon/night × 通常+補完) + /weather warm 補助 step |
+| `daily-message.yml` | `*/30 * * * *` (polling) | 「今日のひとこと」 API を call。 JST 時刻から slot 自動判定 (06-12=morning / 12-18=noon / 18-24=night / 00-06=skip)、 API 冪等性で既存 slot は HTTP 200 skipped、 各 slot 最終 30 分 (11:30/17:30/23:30 JST) は `is_backfill=true` で失敗時 email 通知 |
 | `update-readme-stats.yml` | `0 0 1 * *` (毎月1日 09:00 JST) | minami-baseball-ob を `DOCS_SYNC_PAT` で checkout して file/Supabase 計測、 3 repo (minami-baseball-ob / minami-baseball-ob-docs / yasumorishima profile) の `<!--stat:KEY-->...<!--/stat-->` と `<!--ob:KEY-->...<!--/ob-->` marker を auto-update |
 
 全 `runs-on: ubuntu-latest` で public 無料枠運用。
