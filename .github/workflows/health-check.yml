@@ -32,7 +32,7 @@ jobs:
             --arg secret "$GAS_WEBHOOK_SECRET" \
             --arg ts "$(date -u +%FT%TZ)" \
             '{secret:$secret, event_type:"health-check", client_payload:{source:"public-cron-health-check", at:$ts}}')
-          http=$(echo "$payload" | curl -sS -o /tmp/probe-body -w "%{http_code}" \
+          http=$(echo "$payload" | curl --max-time 20 -sS -o /tmp/probe-body -w "%{http_code}" \
             -X POST "$VERCEL_PROXY_URL" \
             -H "Content-Type: application/json" \
             --data @-)
@@ -96,11 +96,12 @@ jobs:
           # Send approval-notify with missing `to` field. Expected response: "to required"
           # (secret matched, missing param). "unauthorized" body = secret mismatch.
           payload=$(jq -nc --arg secret "$GAS_WEBHOOK_SECRET" '{secret:$secret, action:"approval-notify"}')
-          # GAS Web Apps return 302 to a googleusercontent.com URL; preserve POST method through redirect
-          http=$(echo "$payload" | curl -sS -L --post301 --post302 --post303 -o /tmp/issueform-body -w "%{http_code}" \
-            -X POST "$GAS_WEBHOOK_URL" \
+          # GAS Web Apps return 302 to a googleusercontent.com URL that serves the stored response over GET.
+          # Use curl's default (no -X POST + no --post302): POST initial, auto-convert to GET on 302 redirect.
+          http=$(echo "$payload" | curl --max-time 25 -sS -L -o /tmp/issueform-body -w "%{http_code}" \
+            "$GAS_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
-            --data @-)
+            --data-binary @-)
           body=$(cat /tmp/issueform-body | head -c 500)
           echo "issueform_http=$http body=$body"
           if [ "$http" != "200" ]; then
