@@ -1,0 +1,112 @@
+name: Member Pipeline Health Check
+
+on:
+  schedule:
+    - cron: "7 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: health-check
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    env:
+      VERCEL_PROXY_URL: https://minami-baseball-ob.vercel.app/api/gas-proxy/dispatch
+      OWNER: yasumorishima
+      PROBE_REPO: minami-public-cron
+      # Threshold for GAS heartbeat freshness (seconds). cron is hourly so allow up to 2h tolerance.
+      GAS_HEARTBEAT_MAX_AGE_SEC: 7800
+    steps:
+      - name: Probe Vercel proxy with health-check dispatch
+        env:
+          GAS_WEBHOOK_SECRET: ${{ secrets.GAS_WEBHOOK_SECRET }}
+        run: |
+          set -euo pipefail
+          payload=$(jq -nc \
+            --arg secret "$GAS_WEBHOOK_SECRET" \
+            --arg ts "$(date -u +%FT%TZ)" \
+            '{secret:$secret, event_type:"health-check", client_payload:{source:"public-cron-health-check", at:$ts}}')
+          http=$(echo "$payload" | curl -sS -o /tmp/probe-body -w "%{http_code}" \
+            -X POST "$VERCEL_PROXY_URL" \
+            -H "Content-Type: application/json" \
+            --data @-)
+          echo "vercel_proxy_http=$http"
+          head -c 500 /tmp/probe-body || true
+          echo ""
+          if [ "$http" != "200" ]; then
+            echo "::error::Vercel proxy returned HTTP $http (expected 200). Pipeline likely broken: GAS_WEBHOOK_SECRET mismatch, App token, or proxy down."
+            exit 1
+          fi
+
+      - name: Wait for dispatch to land
+        run: sleep 45
+
+      - name: Verify health-check-ack workflow ran within last 5 minutes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Get most recent health-check-ack run with action=health-check
+          latest=$(gh api "repos/${OWNER}/${PROBE_REPO}/actions/workflows/health-check-ack.yml/runs?event=repository_dispatch&per_page=10" \
+            --jq '[.workflow_runs[] | select(.display_title=="health-check" or .name=="Health Check Ack")] | .[0]')
+          if [ -z "$latest" ] || [ "$latest" = "null" ]; then
+            echo "::error::No health-check-ack run found at all (workflow not installed?)."
+            exit 1
+          fi
+          created_at=$(echo "$latest" | jq -r '.created_at')
+          run_age_sec=$(( $(date -u +%s) - $(date -u -d "$created_at" +%s) ))
+          echo "latest_ack_created_at=$created_at age_sec=$run_age_sec"
+          if [ "$run_age_sec" -gt 600 ]; then
+            echo "::error::Latest health-check-ack ran $run_age_sec seconds ago (>10min). dispatch chain likely broken."
+            exit 1
+          fi
+
+      - name: Verify GAS heartbeat freshness (gas-heartbeat-ack)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Latest run from action=gas-heartbeat
+          latest=$(gh api "repos/${OWNER}/${PROBE_REPO}/actions/workflows/health-check-ack.yml/runs?event=repository_dispatch&per_page=30" \
+            --jq '[.workflow_runs[] | select(.display_title=="gas-heartbeat")] | .[0]')
+          if [ -z "$latest" ] || [ "$latest" = "null" ]; then
+            echo "::warning::No gas-heartbeat run ever seen yet (GAS trigger may not be installed). Skipping freshness check."
+            exit 0
+          fi
+          created_at=$(echo "$latest" | jq -r '.created_at')
+          age_sec=$(( $(date -u +%s) - $(date -u -d "$created_at" +%s) ))
+          echo "latest_gas_heartbeat=$created_at age_sec=$age_sec threshold=$GAS_HEARTBEAT_MAX_AGE_SEC"
+          if [ "$age_sec" -gt "$GAS_HEARTBEAT_MAX_AGE_SEC" ]; then
+            echo "::error::GAS heartbeat is $age_sec seconds old (>${GAS_HEARTBEAT_MAX_AGE_SEC}s). GAS time trigger may be silently dead (OAuth scope failure pattern)."
+            exit 1
+          fi
+
+      - name: Verify recent sync-roles polling success
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          latest=$(gh api "repos/${OWNER}/${PROBE_REPO}/actions/workflows/sync-roles.yml/runs?per_page=10" \
+            --jq '[.workflow_runs[] | select(.conclusion!=null)] | .[0]')
+          if [ -z "$latest" ] || [ "$latest" = "null" ]; then
+            echo "::warning::No completed sync-roles runs yet. Skipping."
+            exit 0
+          fi
+          conclusion=$(echo "$latest" | jq -r '.conclusion')
+          created_at=$(echo "$latest" | jq -r '.created_at')
+          age_sec=$(( $(date -u +%s) - $(date -u -d "$created_at" +%s) ))
+          echo "latest_sync_roles conclusion=$conclusion age=$age_sec"
+          if [ "$age_sec" -gt 3600 ]; then
+            echo "::error::Most recent sync-roles run is $age_sec seconds old (>1h). Schedule may have stopped."
+            exit 1
+          fi
+          if [ "$conclusion" != "success" ]; then
+            echo "::error::Most recent sync-roles run conclusion=$conclusion."
+            exit 1
+          fi
