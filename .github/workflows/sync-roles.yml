@@ -1,0 +1,195 @@
+name: Sync Member Roles (public-cron polling)
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      memo:
+        description: "実行メモ"
+        required: false
+  repository_dispatch:
+    types: [sync-roles]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-roles
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      PRIVATE_REPO_OWNER: yasumorishima
+      PRIVATE_REPO_NAME: minami-baseball-ob
+    steps:
+      - name: Mint GitHub App installation token
+        id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ env.PRIVATE_REPO_OWNER }}
+          repositories: ${{ env.PRIVATE_REPO_NAME }}
+
+      - name: Fetch members.yml from private repo
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p config
+          gh api "repos/${PRIVATE_REPO_OWNER}/${PRIVATE_REPO_NAME}/contents/config/members.yml" \
+            -H "Accept: application/vnd.github.raw" > config/members.yml
+          wc -c config/members.yml
+
+      - name: Sync roles to Supabase (idempotent)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GAS_WEBHOOK_URL: ${{ secrets.GAS_WEBHOOK_URL }}
+          GAS_WEBHOOK_SECRET: ${{ secrets.GAS_WEBHOOK_SECRET }}
+        run: |
+          set -euo pipefail
+          pip install pyyaml -q
+
+          python3 << 'PYTHON'
+          import yaml, json, os, re, urllib.request, urllib.error
+
+          SUPABASE_URL = os.environ["SUPABASE_URL"]
+          KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+          GAS_WEBHOOK_URL = os.environ.get("GAS_WEBHOOK_URL", "")
+          GAS_WEBHOOK_SECRET = os.environ.get("GAS_WEBHOOK_SECRET", "")
+          HEADERS = {
+              "apikey": KEY,
+              "Authorization": f"Bearer {KEY}",
+              "Content-Type": "application/json",
+              "Prefer": "return=minimal",
+          }
+
+          notify_queue = []
+
+          with open("config/members.yml") as f:
+              raw_lines = f.readlines()
+          with open("config/members.yml") as f:
+              config = yaml.safe_load(f)
+
+          uid_meta = {}
+          for line in raw_lines:
+              m = re.match(r'\s*-\s+([\w-]+)(?:\s+#\s*(\d+)期)?', line.strip())
+              if m:
+                  uid, grad = m.group(1), m.group(2)
+                  uid_meta[uid] = {"graduation_class": grad}
+
+          admin_uids = config.get("admin") or []
+          editor_uids = config.get("editor") or []
+          member_uids = config.get("member") or []
+          all_uids = {uid: "member" for uid in member_uids}
+          all_uids.update({uid: "editor" for uid in editor_uids})
+          all_uids.update({uid: "admin" for uid in admin_uids})
+
+          url = f"{SUPABASE_URL}/rest/v1/user_roles?select=id,user_id,role,display_name,graduation_class"
+          req = urllib.request.Request(url, headers=HEADERS)
+          with urllib.request.urlopen(req) as resp:
+              existing_roles = json.loads(resp.read())
+          existing_map = {r["user_id"]: r for r in existing_roles}
+
+          updated = 0
+          created = 0
+
+          for uid, target_role in all_uids.items():
+              meta = uid_meta.get(uid, {})
+              grad = meta.get("graduation_class")
+
+              if uid in existing_map:
+                  current = existing_map[uid]
+                  changes = {}
+                  role_changed_from = None
+                  if current["role"] != target_role:
+                      changes["role"] = target_role
+                      role_changed_from = current["role"]
+                  if grad and not current.get("graduation_class"):
+                      changes["graduation_class"] = grad
+                  if changes:
+                      row_id = current["id"]
+                      url = f"{SUPABASE_URL}/rest/v1/user_roles?id=eq.{row_id}"
+                      body = json.dumps(changes).encode()
+                      req = urllib.request.Request(url, data=body, headers=HEADERS, method="PATCH")
+                      urllib.request.urlopen(req)
+                      print(f"  Updated {uid[:8]}: {changes}")
+                      updated += 1
+                      if role_changed_from is not None:
+                          change_type = "created" if role_changed_from == "viewer" else "upgraded"
+                          notify_queue.append((uid, target_role, change_type, grad or current.get("graduation_class") or ""))
+              else:
+                  url = f"{SUPABASE_URL}/rest/v1/user_roles"
+                  payload = {"user_id": uid, "role": target_role}
+                  if grad:
+                      payload["graduation_class"] = grad
+                  body = json.dumps(payload).encode()
+                  req = urllib.request.Request(url, data=body, headers=HEADERS, method="POST")
+                  urllib.request.urlopen(req)
+                  print(f"  Created {uid[:8]}: {target_role}")
+                  created += 1
+                  notify_queue.append((uid, target_role, "created", grad or ""))
+
+          for uid, role_info in existing_map.items():
+              if uid not in all_uids and role_info["role"] != "viewer":
+                  row_id = role_info["id"]
+                  url = f"{SUPABASE_URL}/rest/v1/user_roles?id=eq.{row_id}"
+                  body = json.dumps({"role": "viewer"}).encode()
+                  req = urllib.request.Request(url, data=body, headers=HEADERS, method="PATCH")
+                  urllib.request.urlopen(req)
+                  print(f"  Demoted {uid[:8]}: {role_info['role']} -> viewer")
+                  updated += 1
+
+          print(f"\n✅ Done: {created} created, {updated} updated")
+
+          if notify_queue and GAS_WEBHOOK_URL and GAS_WEBHOOK_SECRET:
+              try:
+                  auth_headers = {
+                      "apikey": KEY,
+                      "Authorization": f"Bearer {KEY}",
+                      "Content-Type": "application/json",
+                  }
+                  url = f"{SUPABASE_URL}/auth/v1/admin/users?per_page=1000"
+                  req = urllib.request.Request(url, headers=auth_headers)
+                  with urllib.request.urlopen(req) as resp:
+                      auth_data = json.loads(resp.read())
+                  uid_to_email = {u["id"]: u.get("email", "") for u in auth_data.get("users", [])}
+
+                  for uid, role, change_type, grad in notify_queue:
+                      email = uid_to_email.get(uid, "")
+                      if not email:
+                          print(f"  ⚠ no email for {uid[:8]}, skipping notification")
+                          continue
+                      payload = {
+                          "secret": GAS_WEBHOOK_SECRET,
+                          "action": "approval-notify",
+                          "to": email,
+                          "graduation_class": grad,
+                          "role": role,
+                          "change_type": change_type,
+                      }
+                      try:
+                          body = json.dumps(payload).encode()
+                          req = urllib.request.Request(
+                              GAS_WEBHOOK_URL,
+                              data=body,
+                              headers={"Content-Type": "application/json"},
+                              method="POST",
+                          )
+                          with urllib.request.urlopen(req, timeout=30) as resp:
+                              resp_data = json.loads(resp.read())
+                              if resp_data.get("success"):
+                                  print(f"  📧 Notified {uid[:8]} ({role}, {change_type})")
+                              else:
+                                  print(f"  ⚠ notify failed for {uid[:8]}: {resp_data}")
+                      except Exception as e:
+                          print(f"  ⚠ notify error for {uid[:8]}: {e}")
+              except Exception as e:
+                  print(f"::warning::notification block failed (role sync already succeeded): {e}")
+          elif notify_queue:
+              print(f"  ℹ️ {len(notify_queue)} notifications skipped (GAS_WEBHOOK_URL/SECRET not set)")
+          PYTHON
