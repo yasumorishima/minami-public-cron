@@ -1,0 +1,18 @@
+name: Health Check Ack
+
+on:
+  repository_dispatch:
+    types: [health-check, gas-heartbeat]
+
+permissions:
+  contents: read
+
+jobs:
+  ack:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log heartbeat
+        run: |
+          echo "kind=${{ github.event.action }}"
+          echo "received_at_utc=$(date -u +%FT%TZ)"
+          echo "payload=$(echo '${{ toJSON(github.event.client_payload) }}' | head -c 500)"
