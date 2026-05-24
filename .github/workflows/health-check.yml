@@ -131,8 +131,10 @@ jobs:
           created_at=$(echo "$latest" | jq -r '.created_at')
           age_sec=$(( $(date -u +%s) - $(date -u -d "$created_at" +%s) ))
           echo "latest_sync_roles conclusion=$conclusion age=$age_sec"
-          if [ "$age_sec" -gt 3600 ]; then
-            echo "::error::Most recent sync-roles run is $age_sec seconds old (>1h). Schedule may have stopped."
+          # */15 cron + GHA scheduler drift can stretch the gap; 3h is a generous upper bound
+          # that still catches a hard stop (workflow disabled / cron stripped).
+          if [ "$age_sec" -gt 10800 ]; then
+            echo "::error::Most recent sync-roles run is $age_sec seconds old (>3h). Schedule may have stopped."
             exit 1
           fi
           if [ "$conclusion" != "success" ]; then
