@@ -1,0 +1,250 @@
+name: Member Request PR (public-cron)
+
+on:
+  repository_dispatch:
+    types: [member-request]
+
+permissions:
+  contents: read
+
+jobs:
+  create-pr:
+    runs-on: ubuntu-latest
+    env:
+      PRIVATE_REPO_OWNER: yasumorishima
+      PRIVATE_REPO_NAME: minami-baseball-ob
+    steps:
+      - name: Mint GitHub App installation token
+        id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ env.PRIVATE_REPO_OWNER }}
+          repositories: ${{ env.PRIVATE_REPO_NAME }}
+
+      - name: Clone private repo with App token
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          git clone --depth=20 "https://x-access-token:${GH_TOKEN}@github.com/${PRIVATE_REPO_OWNER}/${PRIVATE_REPO_NAME}.git" private-repo
+
+      - name: Create member PR
+        working-directory: private-repo
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          INPUT_EMAIL: ${{ github.event.client_payload.email }}
+          INPUT_NAME: ${{ github.event.client_payload.name }}
+          INPUT_GRAD_CLASS: ${{ github.event.client_payload.graduation_class }}
+          INPUT_NEEDS_EDITOR: ${{ github.event.client_payload.needs_editor }}
+        run: |
+          set -euo pipefail
+          pip install pyyaml -q
+          python3 << 'PYTHON'
+          import yaml, json, os, subprocess, sys, re, time, urllib.request, urllib.error
+          import textwrap
+
+          email = os.environ.get("INPUT_EMAIL", "").strip()
+          name = os.environ.get("INPUT_NAME", "").strip()
+          grad_class = re.sub(r'\D', '', os.environ.get("INPUT_GRAD_CLASS", "")).strip()
+          needs_editor = os.environ.get("INPUT_NEEDS_EDITOR", "").strip()
+          SUPABASE_URL = os.environ["SUPABASE_URL"]
+          KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+
+          if not email:
+              print("::error::email is required")
+              sys.exit(1)
+
+          requested_role = "editor" if needs_editor in ("true", "要") else "member"
+
+          AUTH_HEADERS = {
+              "apikey": KEY,
+              "Authorization": f"Bearer {KEY}",
+              "Content-Type": "application/json",
+          }
+          url = f"{SUPABASE_URL}/auth/v1/admin/users?per_page=1000"
+          req = urllib.request.Request(url, headers=AUTH_HEADERS)
+          with urllib.request.urlopen(req) as resp:
+              data = json.loads(resp.read())
+          users = data.get("users", [])
+
+          uid = None
+          for user in users:
+              if user.get("email", "").lower() == email.lower():
+                  uid = user["id"]
+                  break
+
+          if not uid:
+              print("::error::該当メールアドレスのユーザーが見つかりません。先にGoogleログインしてください。")
+              sys.exit(1)
+
+          with open("config/members.yml") as f:
+              config = yaml.safe_load(f)
+
+          current_role = None
+          for r in ["admin", "editor", "member"]:
+              if uid in (config.get(r) or []):
+                  current_role = r
+                  break
+
+          if current_role == "admin":
+              print("::warning::admin権限はワークフローから変更できません")
+              sys.exit(0)
+
+          if current_role == requested_role:
+              print(f"::warning::{uid[:8]} は既に {requested_role} として登録済みです")
+              sys.exit(0)
+
+          is_role_change = current_role is not None
+
+          REST_HEADERS = {
+              "apikey": KEY,
+              "Authorization": f"Bearer {KEY}",
+              "Content-Type": "application/json",
+              "Prefer": "return=minimal",
+          }
+
+          profile_saved = False
+          try:
+              url = f"{SUPABASE_URL}/rest/v1/user_roles?user_id=eq.{uid}&select=id,display_name,graduation_class"
+              req = urllib.request.Request(url, headers={
+                  "apikey": KEY, "Authorization": f"Bearer {KEY}", "Content-Type": "application/json",
+              })
+              with urllib.request.urlopen(req) as resp:
+                  existing_roles = json.loads(resp.read())
+
+              profile_updates = {}
+              if name:
+                  profile_updates["display_name"] = name
+              if grad_class:
+                  profile_updates["graduation_class"] = grad_class
+
+              if existing_roles:
+                  row = existing_roles[0]
+                  changes = {}
+                  if name and not row.get("display_name"):
+                      changes["display_name"] = name
+                  if grad_class and not row.get("graduation_class"):
+                      changes["graduation_class"] = grad_class
+                  if changes:
+                      url = f"{SUPABASE_URL}/rest/v1/user_roles?user_id=eq.{uid}"
+                      body = json.dumps(changes).encode()
+                      req = urllib.request.Request(url, data=body, headers=REST_HEADERS, method="PATCH")
+                      urllib.request.urlopen(req)
+                      print(f"  Updated profile for {uid[:8]}")
+              else:
+                  url = f"{SUPABASE_URL}/rest/v1/user_roles"
+                  payload = {"user_id": uid, "role": "viewer"}
+                  payload.update(profile_updates)
+                  body = json.dumps(payload).encode()
+                  req = urllib.request.Request(url, data=body, headers=REST_HEADERS, method="POST")
+                  urllib.request.urlopen(req)
+                  print(f"  Created profile for {uid[:8]}")
+              profile_saved = True
+          except Exception as e:
+              print(f"::warning::プロフィール保存に失敗（PR作成は続行）: {e}")
+              profile_saved = False
+
+          with open("config/members.yml") as f:
+              lines = f.readlines()
+
+          comment = f"  - {uid}  # {grad_class}期\n"
+
+          if is_role_change:
+              new_lines = []
+              for line in lines:
+                  if uid in line and line.strip().startswith("- "):
+                      continue
+                  new_lines.append(line)
+              lines = new_lines
+
+          inserted = False
+          new_lines = []
+          i = 0
+          while i < len(lines):
+              line = lines[i]
+              new_lines.append(line)
+
+              if line.strip() == f"{requested_role}: []":
+                  new_lines[-1] = line.replace(f"{requested_role}: []", f"{requested_role}:")
+                  new_lines.append(comment)
+                  inserted = True
+              elif line.strip() == f"{requested_role}:" and not inserted:
+                  i += 1
+                  while i < len(lines) and (lines[i].startswith("  - ") or lines[i].startswith("  # ")):
+                      new_lines.append(lines[i])
+                      i += 1
+                  new_lines.append(comment)
+                  inserted = True
+                  continue
+
+              i += 1
+
+          if not inserted:
+              new_lines.append(f"\n{requested_role}:\n{comment}")
+
+          with open("config/members.yml", "w") as f:
+              f.writelines(new_lines)
+
+          safe_id = uid[:8]
+          timestamp = str(int(time.time()))
+          prefix = "role-change" if is_role_change else "member-request"
+          branch = f"{prefix}/{safe_id}-{timestamp}"
+
+          def run(cmd):
+              subprocess.run(cmd, check=True)
+
+          run(["git", "config", "user.name", "github-actions[bot]"])
+          run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"])
+          run(["git", "checkout", "-b", branch])
+          run(["git", "add", "config/members.yml"])
+
+          site_admin_url = "https://minami-baseball-ob.vercel.app/admin/roles"
+          profile_note = ""
+          if not profile_saved:
+              profile_note = "\n> ⚠️ **プロフィール自動保存に失敗しました。管理画面で手動設定してください。**\n"
+
+          if is_role_change:
+              commit_msg = f"Change member ({grad_class}期): {current_role} → {requested_role} [{safe_id}]"
+              pr_title = f"権限変更: {grad_class}期 {current_role} → {requested_role}"
+              pr_body = textwrap.dedent(f"""\
+              ## 権限変更申請（Googleフォーム経由）
+
+              | 項目 | 内容 |
+              |------|------|
+              | 卒業期 | {grad_class}期 |
+              | 現在の権限 | {current_role} |
+              | 申請先の権限 | {requested_role} |
+              | UID | `{safe_id}...` |
+
+              > **申請者の氏名は[管理画面]({site_admin_url})で確認してください。**
+              > プライバシー保護のため、Git上に個人名を記録しません。
+              {profile_note}
+              **マージすると自動的にSupabaseの権限が更新されます。**""")
+          else:
+              commit_msg = f"Add member ({grad_class}期) as {requested_role} [{safe_id}]"
+              pr_title = f"会員申請: {grad_class}期 → {requested_role}"
+              pr_body = textwrap.dedent(f"""\
+              ## 会員申請（Googleフォーム経由）
+
+              | 項目 | 内容 |
+              |------|------|
+              | 卒業期 | {grad_class}期 |
+              | 権限 | {requested_role} |
+              | UID | `{safe_id}...` |
+
+              > **申請者の氏名は[管理画面]({site_admin_url})で確認してください。**
+              > プライバシー保護のため、Git上に個人名を記録しません。
+              {profile_note}
+              **マージすると自動的にSupabaseの権限が更新されます。**""")
+
+          run(["git", "commit", "-m", commit_msg])
+          run(["git", "push", "origin", branch])
+          run(["gh", "pr", "create", "--title", pr_title, "--body", pr_body])
+
+          action = "権限変更" if is_role_change else "新規登録"
+          print(f"✅ PR created ({action}): {grad_class}期 as {requested_role} [{safe_id}]")
+          PYTHON
