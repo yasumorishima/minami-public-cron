@@ -242,8 +242,8 @@ jobs:
               **マージすると自動的にSupabaseの権限が更新されます。**""")
 
           run(["git", "commit", "-m", commit_msg])
-          run(["git", "push", "origin", branch])
-          run(["gh", "pr", "create", "--title", pr_title, "--body", pr_body])
+          run(["git", "push", "-u", "origin", branch])
+          run(["gh", "pr", "create", "--title", pr_title, "--body", pr_body, "--head", branch, "--base", "master"])
 
           action = "権限変更" if is_role_change else "新規登録"
           print(f"✅ PR created ({action}): {grad_class}期 as {requested_role} [{safe_id}]")
