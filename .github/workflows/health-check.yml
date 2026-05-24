@@ -87,6 +87,33 @@ jobs:
             exit 1
           fi
 
+      - name: Probe gas-issue-form (feedback Gmail path) secret match
+        env:
+          GAS_WEBHOOK_URL: ${{ secrets.GAS_WEBHOOK_URL }}
+          GAS_WEBHOOK_SECRET: ${{ secrets.GAS_WEBHOOK_SECRET }}
+        run: |
+          set -euo pipefail
+          # Send approval-notify with missing `to` field. Expected response: "to required"
+          # (secret matched, missing param). "unauthorized" body = secret mismatch.
+          payload=$(jq -nc --arg secret "$GAS_WEBHOOK_SECRET" '{secret:$secret, action:"approval-notify"}')
+          http=$(echo "$payload" | curl -sS -L -o /tmp/issueform-body -w "%{http_code}" \
+            -X POST "$GAS_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            --data @-)
+          body=$(cat /tmp/issueform-body | head -c 500)
+          echo "issueform_http=$http body=$body"
+          if [ "$http" != "200" ]; then
+            echo "::error::gas-issue-form Web App HTTP $http (expected 200). URL down or webapp manifest stripped — /feedback Gmail notification path broken."
+            exit 1
+          fi
+          if echo "$body" | grep -q "unauthorized"; then
+            echo "::error::gas-issue-form returned unauthorized — WEBHOOK_SECRET drifted from Vercel FEEDBACK_GAS_SECRET. /feedback creates GitHub issue but Gmail notification silently dropped."
+            exit 1
+          fi
+          if ! echo "$body" | grep -q "to required"; then
+            echo "::warning::gas-issue-form unexpected response (expected 'to required'): $body"
+          fi
+
       - name: Verify recent sync-roles polling success
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
