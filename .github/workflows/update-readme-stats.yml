@@ -105,6 +105,27 @@ jobs:
           replace_ob ts_files     "$STATS_TS"
           replace_ob loc          "$STATS_LOC"
 
+          # --- Yokohama Funnies stats (<!--fn:-->) read from funnies README markers ---
+          replace_fn() {
+            local key="$1" val="$2"
+            [ -z "$val" ] && return 0
+            local val_esc
+            val_esc=$(printf '%s' "$val" | sed 's/[\/&]/\&/g')
+            sed -i "s/<!--fn:${key}-->[^<]*<!--\/fn-->/<!--fn:${key}-->${val_esc}<!--\/fn-->/g" /tmp/profile-readme.md
+          }
+          FN_README=$(gh api repos/yasumorishima/yokohama-funnies/contents/README.md -H "Accept: application/vnd.github.raw" 2>/dev/null || echo "")
+          if [ -n "$FN_README" ]; then
+            replace_fn pages    "$(printf '%s' "$FN_README" | grep -oP '<!--stat:pages-->\K[^<]*' | head -1)"
+            replace_fn ts_files "$(printf '%s' "$FN_README" | grep -oP '<!--stat:ts_files-->\K[^<]*' | head -1)"
+            replace_fn loc      "$(printf '%s' "$FN_README" | grep -oP '<!--stat:loc-->\K[^<]*' | head -1)"
+            FN_TM=$(printf '%s' "$FN_README" | grep -oP '<!--stat:tables_main-->\K[^<]*' | head -1)
+            FN_TH=$(printf '%s' "$FN_README" | grep -oP '<!--stat:tables_hist-->\K[^<]*' | head -1)
+            [ -n "$FN_TM" ] && [ -n "$FN_TH" ] && replace_fn db_tables "$((FN_TM + FN_TH))"
+            echo "funnies fn: markers updated"
+          else
+            echo "::warning::could not read funnies README (DOCS_SYNC_PAT access?) - fn: markers unchanged"
+          fi
+
           ENCODED=$(base64 -w 0 < /tmp/profile-readme.md)
           gh api repos/yasumorishima/yasumorishima/contents/README.md \
             -X PUT \
