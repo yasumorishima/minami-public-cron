@@ -134,3 +134,29 @@ jobs:
             -f sha="$SHA" \
             --silent
           echo "profile README updated"
+
+      - name: Sync funnies docs README stats
+        env:
+          GH_TOKEN: ${{ secrets.DOCS_SYNC_PAT }}
+        run: |
+          python3 - <<'PY'
+          import subprocess, json, re, binascii
+          fn = subprocess.run(["gh","api","repos/yasumorishima/yokohama-funnies/contents/README.md","-H","Accept: application/vnd.github.raw"],capture_output=True,text=True).stdout
+          stats = dict(re.findall(r"<!--stat:([a-z_]+)-->([^<]*)<!--/stat-->", fn))
+          dr = subprocess.run(["gh","api","repos/yasumorishima/yokohama-funnies-docs/contents/README.md"],capture_output=True,text=True)
+          if not stats or dr.returncode != 0:
+              print("::warning::funnies stats or docs read failed (DOCS_SYNC_PAT access?)")
+          else:
+              obj = json.loads(dr.stdout)
+              content = binascii.a2b_base64(obj["content"]).decode()
+              new = content
+              for k, v in stats.items():
+                  new = re.sub("<!--stat:" + k + "-->[^<]*<!--/stat-->", "<!--stat:" + k + "-->" + v + "<!--/stat-->", new)
+              if new == content:
+                  print("funnies-docs: no change")
+              else:
+                  enc = binascii.b2a_base64(new.encode(), newline=False).decode()
+                  payload = json.dumps({"message": "docs: auto-update funnies repo stats", "content": enc, "sha": obj["sha"]})
+                  r = subprocess.run(["gh","api","-X","PUT","repos/yasumorishima/yokohama-funnies-docs/contents/README.md","--input","-"], input=payload, capture_output=True, text=True)
+                  print("funnies-docs stats updated" if r.returncode == 0 else "::warning::funnies-docs PUT failed " + r.stderr[:150])
+          PY
