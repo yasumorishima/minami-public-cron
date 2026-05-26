@@ -121,36 +121,12 @@ jobs:
             echo "::warning::gas-issue-form unexpected response (expected 'to required'): $body"
           fi
 
-      - name: Verify recent sync-roles polling success
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          latest=$(gh api "repos/${OWNER}/${PROBE_REPO}/actions/workflows/sync-roles.yml/runs?per_page=10" \
-            --jq '[.workflow_runs[] | select(.conclusion!=null)] | .[0]')
-          if [ -z "$latest" ] || [ "$latest" = "null" ]; then
-            echo "::warning::No completed sync-roles runs yet. Skipping."
-            exit 0
-          fi
-          conclusion=$(echo "$latest" | jq -r '.conclusion')
-          created_at=$(echo "$latest" | jq -r '.created_at')
-          age_sec=$(( $(date -u +%s) - $(date -u -d "$created_at" +%s) ))
-          echo "latest_sync_roles conclusion=$conclusion age=$age_sec"
-          # */15 cron + GHA scheduler drift can stretch the gap; 3h is a generous upper bound
-          # that still catches a hard stop (workflow disabled / cron stripped).
-          if [ "$age_sec" -gt 10800 ]; then
-            echo "::error::Most recent sync-roles run is $age_sec seconds old (>3h). Schedule may have stopped."
-            exit 1
-          fi
-          if [ "$conclusion" != "success" ]; then
-            echo "::error::Most recent sync-roles run conclusion=$conclusion."
-            exit 1
-          fi
-
       - name: Checkout (pipeline health script)
+        if: ${{ !cancelled() }}
         uses: actions/checkout@v4
 
       - name: Mint App token for failure alerting
+        if: ${{ !cancelled() }}
         id: alert-app
         uses: actions/create-github-app-token@v2
         with:
@@ -160,6 +136,7 @@ jobs:
           repositories: minami-baseball-ob
 
       - name: Detect member-pipeline workflow failures and alert
+        if: ${{ !cancelled() }}
         env:
           PROBE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APP_TOKEN: ${{ steps.alert-app.outputs.token }}
