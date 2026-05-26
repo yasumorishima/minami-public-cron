@@ -19,7 +19,8 @@ BAD = {"failure", "cancelled", "timed_out", "startup_failure"}
 MAX_AGE_SEC = 93600
 # cron 定期実行ワークフローの liveness しきい値 (秒)。直近 run がこれより古ければ「停止」とみなす。
 # member-request は申請時しか走らない event-driven なので対象外。
-LIVENESS = {"sync-roles.yml": 10800}
+# GitHub は */15 cron を実際は ~4h に間引くため、stall 判定は 6h で誤検知を避ける
+LIVENESS = {"sync-roles.yml": 21600}
 
 PROBE_TOKEN = os.environ["PROBE_TOKEN"]
 APP_TOKEN = os.environ["APP_TOKEN"]
