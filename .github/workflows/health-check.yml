@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "7 * * * *"
   workflow_dispatch:
+    inputs:
+      force_test_alert:
+        description: "1 でアラート経路(issue+メール)を合成失敗で検証"
+        required: false
+        default: "0"
 
 permissions:
   contents: read
@@ -141,3 +146,24 @@ jobs:
             echo "::error::Most recent sync-roles run conclusion=$conclusion."
             exit 1
           fi
+
+      - name: Checkout (pipeline health script)
+        uses: actions/checkout@v4
+
+      - name: Mint App token for failure alerting
+        id: alert-app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ env.OWNER }}
+          repositories: minami-baseball-ob
+
+      - name: Detect member-pipeline workflow failures and alert
+        env:
+          PROBE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_TOKEN: ${{ steps.alert-app.outputs.token }}
+          GAS_WEBHOOK_URL: ${{ secrets.GAS_WEBHOOK_URL }}
+          GAS_WEBHOOK_SECRET: ${{ secrets.GAS_WEBHOOK_SECRET }}
+          HEALTHCHECK_FORCE_TEST: ${{ github.event.inputs.force_test_alert }}
+        run: python3 scripts/check-pipeline-health.py
