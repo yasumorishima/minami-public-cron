@@ -1,0 +1,77 @@
+name: Purge Deleted Records
+
+on:
+  schedule:
+    - cron: '0 19 * * *'  # 毎日 UTC 19:00（JST 4:00）
+  workflow_dispatch:
+    inputs:
+      memo:
+        description: "実行メモ"
+        required: true
+
+permissions: {}
+
+jobs:
+  purge:
+    runs-on: ubuntu-latest
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      PURGE_DAYS: 7
+    steps:
+      - name: Purge expired photos (Storage + DB)
+        run: |
+          CUTOFF=$(date -u -d "${PURGE_DAYS} days ago" +%Y-%m-%dT%H:%M:%S)
+          echo "Cutoff: ${CUTOFF}"
+
+          RESPONSE=$(curl -sS -X GET \
+            "${SUPABASE_URL}/rest/v1/photos?deleted_at=not.is.null&deleted_at=lt.${CUTOFF}&select=id,storage_path" \
+            -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}")
+
+          COUNT=$(echo "$RESPONSE" | jq length)
+          echo "Found $COUNT photos to purge"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "✅ No photos to purge"
+          else
+            # Storage から削除
+            PATHS=$(echo "$RESPONSE" | jq -r '.[].storage_path')
+            for path in $PATHS; do
+              HTTP_CODE=$(curl -sS -o /dev/null -w "%{http_code}" -X DELETE \
+                "${SUPABASE_URL}/storage/v1/object/photos/${path}" \
+                -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+                -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}")
+              echo "Storage delete ${path}: HTTP ${HTTP_CODE}"
+            done
+
+            # DB レコード削除
+            IDS=$(echo "$RESPONSE" | jq -r '.[].id')
+            for id in $IDS; do
+              curl -sS -o /dev/null -w "DB delete photo ${id}: HTTP %{http_code}\n" -X DELETE \
+                "${SUPABASE_URL}/rest/v1/photos?id=eq.${id}" \
+                -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+                -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}"
+            done
+            echo "✅ Purged $COUNT photos"
+          fi
+
+      - name: Purge expired content records
+        run: |
+          CUTOFF=$(date -u -d "${PURGE_DAYS} days ago" +%Y-%m-%dT%H:%M:%S)
+
+          for TABLE in results schedule announcements members_posts golf_competitions dues_payments; do
+            HTTP_CODE=$(curl -sS -o /tmp/purge_${TABLE}.json -w "%{http_code}" -X DELETE \
+              "${SUPABASE_URL}/rest/v1/${TABLE}?deleted_at=not.is.null&deleted_at=lt.${CUTOFF}" \
+              -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+              -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
+              -H "Prefer: return=representation")
+
+            if [ "$HTTP_CODE" = "200" ]; then
+              COUNT=$(cat /tmp/purge_${TABLE}.json | jq length)
+              echo "✅ ${TABLE}: purged ${COUNT} records"
+            else
+              echo "⚠️ ${TABLE}: HTTP ${HTTP_CODE}"
+              cat /tmp/purge_${TABLE}.json
+            fi
+          done
