@@ -76,7 +76,7 @@ jobs:
         working-directory: private-repo
         run: |
           npm install playwright
-          npx playwright install --with-deps chromium
+          ./node_modules/.bin/playwright install --with-deps chromium
 
       - name: Check for new games
         id: scrape
