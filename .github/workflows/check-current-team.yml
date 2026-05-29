@@ -1,0 +1,142 @@
+name: Check Current Team Results (public-cron)
+
+on:
+  schedule:
+    - cron: '0 10 * * 1'   # 毎週月曜 UTC 10:00 (JST 19:00)
+  workflow_dispatch:
+    inputs:
+      memo:
+        description: "実行メモ"
+        required: true
+      year:
+        description: "kyureki.com年度（空欄で自動判定）"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      PRIVATE_REPO_OWNER: yasumorishima
+      PRIVATE_REPO_NAME: minami-baseball-ob
+    steps:
+      # App トークンは外部 action ではなく openssl+curl で自前生成 (member-request と同方式)
+      - name: Mint GitHub App installation token
+        id: app
+        env:
+          APP_ID: ${{ secrets.APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+          OWNER: ${{ env.PRIVATE_REPO_OWNER }}
+          REPO: ${{ env.PRIVATE_REPO_NAME }}
+        run: |
+          set -uo pipefail
+          b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+          key_file="$(mktemp)"
+          printf '%s\n' "$APP_PRIVATE_KEY" > "$key_file"
+          mint() {
+            local now header payload unsigned sig jwt inst_id tok
+            now=$(date +%s)
+            header=$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)
+            payload=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "$((now-60))" "$((now+540))" "$APP_ID" | b64url)
+            unsigned="${header}.${payload}"
+            sig=$(printf '%s' "$unsigned" | openssl dgst -sha256 -sign "$key_file" -binary | b64url) || return 1
+            jwt="${unsigned}.${sig}"
+            inst_id=$(curl -s --max-time 20 -H "Authorization: Bearer $jwt" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${OWNER}/${REPO}/installation" | jq -r '.id')
+            [ -n "$inst_id" ] && [ "$inst_id" != "null" ] || return 1
+            tok=$(curl -s --max-time 20 -X POST -H "Authorization: Bearer $jwt" -H "Accept: application/vnd.github+json" "https://api.github.com/app/installations/${inst_id}/access_tokens" -d "{\"repositories\":[\"${REPO}\"]}" | jq -r '.token')
+            [ -n "$tok" ] && [ "$tok" != "null" ] || return 1
+            printf '%s' "$tok"
+          }
+          token=""
+          for attempt in 1 2 3; do
+            token=$(mint) && [ -n "$token" ] && break
+            echo "token mint attempt ${attempt} failed; retrying..." >&2
+            token=""
+            sleep 5
+          done
+          rm -f "$key_file"
+          if [ -z "$token" ]; then echo "::error::failed to mint GitHub App token after retries"; exit 1; fi
+          echo "::add-mask::$token"
+          echo "token=${token}" >> "$GITHUB_OUTPUT"
+
+      - name: Clone private repo with App token
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          git clone --depth=20 "https://x-access-token:${GH_TOKEN}@github.com/${PRIVATE_REPO_OWNER}/${PRIVATE_REPO_NAME}.git" private-repo
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Playwright
+        working-directory: private-repo
+        run: |
+          npm install playwright
+          npx playwright install --with-deps chromium
+
+      - name: Check for new games
+        id: scrape
+        working-directory: private-repo
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          YEAR_ARG="${{ github.event.inputs.year }}"
+          set +e
+          if [ -n "$YEAR_ARG" ]; then
+            NEW_GAMES=$(node scripts/check-current-team-results.js "$YEAR_ARG" 2>/tmp/scrape.log)
+          else
+            NEW_GAMES=$(node scripts/check-current-team-results.js 2>/tmp/scrape.log)
+          fi
+          EXIT_CODE=$?
+          set -e
+          cat /tmp/scrape.log
+          if [ "$EXIT_CODE" -eq 0 ]; then
+            echo "has_new=true" >> "$GITHUB_OUTPUT"
+            echo "$NEW_GAMES" > /tmp/new_games.json
+          elif [ "$EXIT_CODE" -eq 1 ]; then
+            echo "has_new=false" >> "$GITHUB_OUTPUT"
+            echo "✅ No new games"
+          else
+            echo "❌ Script failed"
+            exit 1
+          fi
+
+      - name: Create Issue for new games
+        if: steps.scrape.outputs.has_new == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          node <<'NODE' > /tmp/issue_body.md
+          const fs = require('fs');
+          const newGames = JSON.parse(fs.readFileSync('/tmp/new_games.json', 'utf-8'));
+          const rows = newGames.map(g => {
+            const emoji = g.result === '○' ? '🟢' : g.result === '●' ? '🔴' : '🟡';
+            const src = g.source === 'kyureki' ? '球歴' : 'HBN';
+            return `| ${emoji} ${g.result} | ${g.date} | ${g.opponent} | ${g.score_us}-${g.score_them} | ${g.tournament_type} ${g.round} | ${src} |`;
+          }).join('\n');
+          const body = [
+            '## 🏟️ 歴代戦績に新しい試合結果を追加しました', '',
+            `南高野球部の新しい試合結果 **${newGames.length}件** を検出し、Supabaseに自動登録しました。`, '',
+            '### 追加された試合', '',
+            '| 結果 | 日付 | 対戦相手 | スコア | 大会 | ソース |',
+            '|------|------|----------|--------|------|--------|',
+            rows, '',
+            '### 確認のお願い',
+            '- [歴代戦績ページ](https://minami-baseball-ob.vercel.app/history)で表示を確認してください',
+            '- スコア・対戦相手・大会種別に誤りがあれば[編集ページ](https://minami-baseball-ob.vercel.app/edit/history)で修正できます', '',
+            '> ⚠️ スクレイピングデータのため、内容に誤りがある可能性があります。',
+          ].join('\n');
+          console.log(body);
+          NODE
+          COUNT=$(jq length /tmp/new_games.json)
+          gh issue create \
+            --repo "${PRIVATE_REPO_OWNER}/${PRIVATE_REPO_NAME}" \
+            --title "🏟️ 歴代戦績: ${COUNT}試合を自動追加" \
+            --body-file /tmp/issue_body.md \
+            --label auto-senseki
