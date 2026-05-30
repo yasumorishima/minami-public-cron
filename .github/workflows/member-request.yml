@@ -179,46 +179,16 @@ jobs:
               print(f"::warning::プロフィール保存に失敗（PR作成は続行）: {e}")
               profile_saved = False
 
-          with open("config/members.yml") as f:
-              lines = f.readlines()
-
-          comment = f"  - {uid}  # {grad_class}期\n"
-
-          if is_role_change:
-              new_lines = []
-              for line in lines:
-                  if uid in line and line.strip().startswith("- "):
-                      continue
-                  new_lines.append(line)
-              lines = new_lines
-
-          inserted = False
-          new_lines = []
-          i = 0
-          while i < len(lines):
-              line = lines[i]
-              new_lines.append(line)
-
-              if line.strip() == f"{requested_role}: []":
-                  new_lines[-1] = line.replace(f"{requested_role}: []", f"{requested_role}:")
-                  new_lines.append(comment)
-                  inserted = True
-              elif line.strip() == f"{requested_role}:" and not inserted:
-                  i += 1
-                  while i < len(lines) and (lines[i].startswith("  - ") or lines[i].startswith("  # ")):
-                      new_lines.append(lines[i])
-                      i += 1
-                  new_lines.append(comment)
-                  inserted = True
-                  continue
-
-              i += 1
-
-          if not inserted:
-              new_lines.append(f"\n{requested_role}:\n{comment}")
-
-          with open("config/members.yml", "w") as f:
-              f.writelines(new_lines)
+          # per-applicant file (config/members/<uid>.yml) で衝突を原理的に回避。
+          # sync-roles 側は members.yml + config/members/*.yml を union 読込する。
+          os.makedirs("config/members", exist_ok=True)
+          member_file = f"config/members/{uid}.yml"
+          _data = {"uid": uid, "role": requested_role}
+          if grad_class:
+              _data["graduation_class"] = grad_class
+          with open(member_file, "w") as mf:
+              json.dump(_data, mf, ensure_ascii=False)
+              mf.write("\n")
 
           safe_id = uid[:8]
           timestamp = str(int(time.time()))
@@ -231,7 +201,7 @@ jobs:
           run(["git", "config", "user.name", "github-actions[bot]"])
           run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"])
           run(["git", "checkout", "-b", branch])
-          run(["git", "add", "config/members.yml"])
+          run(["git", "add", member_file])
 
           site_admin_url = "https://minami-baseball-ob.vercel.app/admin/roles"
           profile_note = ""
