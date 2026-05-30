@@ -14,6 +14,8 @@
 |---|---|---|
 | `warm-weather.yml` | `*/30 * * * *` | minami の `/weather` を HTTP GET で warm、 Vercel Data Cache を refresh |
 | `keep-alive.yml` | `0 0 * * 0` (週次) | `/schedule` を HTTP GET して SSR 経由で Supabase fetch を起こし、 Free plan の 7 日無活動 auto-pause を回避 (anon key 不要) |
+| `purge-deleted-photos.yml` | `0 19 * * *` (毎日 JST 4:00) + dispatch | soft-delete >7日の photos を Supabase Storage+DB から物理削除 + content テーブル purge (2026-05-30 private repo から移行) |
+| `check-current-team.yml` | `0 10 * * 1` (週次月曜) + dispatch | App token で minami-baseball-ob を clone し Playwright で新着試合を scrape → Supabase 登録 → private repo に issue 通知 (2026-05-30 移行) |
 | `daily-message.yml` | `*/30 * * * *` (polling) | 「今日のひとこと」 API を call。 JST 時刻から slot 自動判定 (06-12=morning / 12-18=noon / 18-24=night / 00-06=skip)、 API 冪等性で既存 slot は HTTP 200 skipped、 各 slot 最終 30 分 (11:30/17:30/23:30 JST) は `is_backfill=true` で失敗時 email 通知。 **RPi5 cron が同一 endpoint を redundant に call** (GHA scheduler 障害時の fallback) |
 | `update-readme-stats.yml` | `0 0 1 * *` (毎月1日 09:00 JST) | minami-baseball-ob を `DOCS_SYNC_PAT` で checkout して file/Supabase 計測、 3 repo (minami-baseball-ob / minami-baseball-ob-docs / yasumorishima profile) の `<!--stat:KEY-->...<!--/stat-->` と `<!--ob:KEY-->...<!--/ob-->` marker を auto-update |
 
