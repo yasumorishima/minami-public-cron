@@ -2,7 +2,7 @@ name: Sync Member Roles (public-cron polling)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       memo:
@@ -74,6 +74,15 @@ jobs:
           gh api "repos/${PRIVATE_REPO_OWNER}/${PRIVATE_REPO_NAME}/contents/config/members.yml" \
             -H "Accept: application/vnd.github.raw" > config/members.yml
           wc -c config/members.yml
+          mkdir -p config/members
+          _files=$(gh api "repos/${PRIVATE_REPO_OWNER}/${PRIVATE_REPO_NAME}/contents/config/members" --jq '.[]?.name' 2>/dev/null || true)
+          for _f in $_files; do
+            case "$_f" in
+              *.yml|*.yaml)
+                gh api "repos/${PRIVATE_REPO_OWNER}/${PRIVATE_REPO_NAME}/contents/config/members/${_f}" -H "Accept: application/vnd.github.raw" > "config/members/${_f}" ;;
+            esac
+          done
+          echo "per-file count: $(ls -1 config/members/ 2>/dev/null | wc -l)"
 
       - name: Sync roles to Supabase (idempotent)
         env:
@@ -86,7 +95,7 @@ jobs:
           pip install pyyaml -q
 
           python3 << 'PYTHON'
-          import yaml, json, os, re, urllib.request, urllib.error
+          import yaml, json, os, re, glob, urllib.request, urllib.error
 
           SUPABASE_URL = os.environ["SUPABASE_URL"]
           KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
@@ -119,12 +128,33 @@ jobs:
           all_uids = {uid: "member" for uid in member_uids}
           all_uids.update({uid: "editor" for uid in editor_uids})
           all_uids.update({uid: "admin" for uid in admin_uids})
+          for _pf in sorted(glob.glob("config/members/*.yml")) + sorted(glob.glob("config/members/*.yaml")):
+              try:
+                  with open(_pf) as _f:
+                      _d = yaml.safe_load(_f) or {}
+              except Exception as _e:
+                  print("  [warn] skip " + _pf + ": " + str(_e)); continue
+              _u = str(_d.get("uid") or "").strip()
+              _r = str(_d.get("role") or "member").strip()
+              if not _u:
+                  print("  [warn] skip " + _pf + ": no uid"); continue
+              if _r not in ("admin", "editor", "member", "viewer"):
+                  print("  [warn] skip " + _pf + ": bad role " + _r); continue
+              all_uids[_u] = _r
+              _g = _d.get("graduation_class")
+              if _g:
+                  uid_meta[_u] = {"graduation_class": str(_g)}
+          print("  config members total: %d" % len(all_uids))
 
           url = f"{SUPABASE_URL}/rest/v1/user_roles?select=id,user_id,role,display_name,graduation_class"
           req = urllib.request.Request(url, headers=HEADERS)
           with urllib.request.urlopen(req) as resp:
               existing_roles = json.loads(resp.read())
           existing_map = {r["user_id"]: r for r in existing_roles}
+          _active = [r for r in existing_roles if r.get("role") != "viewer"]
+          SKIP_DEMOTIONS = bool(_active) and (len(all_uids) < (len(_active) + 1) // 2)
+          if SKIP_DEMOTIONS:
+              print("::error::SAFETY GUARD: config has %d roled UIDs but %d active rows; skipping ALL demotions." % (len(all_uids), len(_active)))
 
           updated = 0
           created = 0
@@ -167,6 +197,8 @@ jobs:
 
           for uid, role_info in existing_map.items():
               if uid not in all_uids and role_info["role"] != "viewer":
+                  if SKIP_DEMOTIONS:
+                      print("  [guard] demote skipped: " + uid[:8]); continue
                   row_id = role_info["id"]
                   url = f"{SUPABASE_URL}/rest/v1/user_roles?id=eq.{row_id}"
                   body = json.dumps({"role": "viewer"}).encode()
