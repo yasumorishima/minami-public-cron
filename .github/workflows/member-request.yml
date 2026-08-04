@@ -78,8 +78,17 @@ jobs:
           import yaml, json, os, subprocess, sys, re, time, urllib.request, urllib.error
           import textwrap
 
+          def normalize_display_name(raw):
+              # 選手名簿 (players.name) と表記を揃える。日本語だけの氏名は姓名間の空白を
+              # 取り除き、ローマ字表記など ASCII を含む名前は語の区切りが意味を持つので
+              # 連続する空白を半角 1 つに詰めるだけにする。
+              # サイト側 lib/utils.ts の normalizeDisplayName と同一規則。
+              collapsed = re.sub(r"[\s\u3000]+", " ", raw or "").strip()
+              without_spaces = collapsed.replace(" ", "")
+              return collapsed if re.search(r"[A-Za-z0-9]", without_spaces) else without_spaces
+
           email = os.environ.get("INPUT_EMAIL", "").strip()
-          name = os.environ.get("INPUT_NAME", "").strip()
+          name = normalize_display_name(os.environ.get("INPUT_NAME", ""))
           grad_class = re.sub(r'\D', '', os.environ.get("INPUT_GRAD_CLASS", "")).strip()
           needs_editor = os.environ.get("INPUT_NEEDS_EDITOR", "").strip()
           SUPABASE_URL = os.environ["SUPABASE_URL"]
