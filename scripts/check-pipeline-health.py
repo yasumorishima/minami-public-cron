@@ -21,6 +21,10 @@ MAX_AGE_SEC = 93600
 # member-request は申請時しか走らない event-driven なので対象外。
 # GitHub は */15 cron を実際は ~4h に間引くため、stall 判定は 6h で誤検知を避ける
 LIVENESS = {"sync-roles.yml": 21600}
+# ランナー未割当 (0 ステップ) を GitHub 側起因として通知抑制してよい上限 (秒)。
+# これを過ぎても復旧していなければ、原因が何であれ知らせるべきなので抑制しない。
+# (GitHub 障害が継続中なら actions_component_degraded 側が引き続き抑制する)
+SUPPRESS_NEVER_STARTED_MAX_AGE_SEC = 21600
 
 PROBE_TOKEN = os.environ["PROBE_TOKEN"]
 APP_TOKEN = os.environ["APP_TOKEN"]
@@ -100,6 +104,59 @@ def send_email(subject, issue_url):
         return False
 
 
+_ACTIONS_STATUS = {}
+
+
+def actions_component_degraded():
+    """GitHub Status の Actions コンポーネントが operational でなければ True。
+    取得できなければ False (= 抑制しない)。監視を握り潰す方向へは倒さない。"""
+    if "v" in _ACTIONS_STATUS:
+        return _ACTIONS_STATUS["v"]
+    val = False
+    try:
+        req = urllib.request.Request("https://www.githubstatus.com/api/v2/components.json", headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            comps = json.loads(r.read()).get("components", [])
+        for c in comps:
+            if c.get("name") == "Actions":
+                status = c.get("status", "")
+                print("  githubstatus: Actions=%s" % status)
+                val = status != "operational"
+                break
+    except Exception as e:
+        print("  ::warning::githubstatus 取得失敗 (%s) — 抑制せず通常判定します" % e)
+        val = False
+    _ACTIONS_STATUS["v"] = val
+    return val
+
+
+def run_never_started(run_id):
+    """run 内の job が 1 ステップも実行していなければ True (= ランナー未割当)。
+    権限 / secret / コードの不備による失敗は必ず steps >= 1 になるため本物の異常は抑制されない。"""
+    try:
+        data = gh("/repos/%s/%s/actions/runs/%s/jobs?per_page=100" % (OWNER, PUB_REPO, run_id), PROBE_TOKEN)
+    except Exception as e:
+        print("  ::warning::job 一覧の取得失敗 (%s) — 抑制せず通常判定します" % e)
+        return False
+    jobs = data.get("jobs", [])
+    if not jobs:
+        return False
+    for j in jobs:
+        if len(j.get("steps") or []) > 0:
+            return False
+    print("  run %s: 全 job が 0 ステップ (ランナー未割当)" % run_id)
+    return True
+
+
+def infra_outage(st):
+    """GitHub 側インフラ起因の失敗と判断できるなら True。"""
+    if actions_component_degraded():
+        return True
+    if st.get("conclusion") in BAD and st.get("age", 0) <= SUPPRESS_NEVER_STARTED_MAX_AGE_SEC and run_never_started(st["id"]):
+        return True
+    return False
+
+
 def detect_problem(wf, st):
     """問題があれば説明文字列を返す。健全なら None。"""
     if st["conclusion"] in BAD and st["age"] <= MAX_AGE_SEC:
@@ -118,7 +175,7 @@ def main():
             continue
         a = age_sec(run.get("created_at", "")) if run.get("created_at") else 1e12
         print("%s: 最新 conclusion=%s age=%.0fs url=%s" % (wf, run.get("conclusion"), a, run.get("html_url", "")))
-        statuses[wf] = {"conclusion": run.get("conclusion"), "age": a, "created": run.get("created_at", ""), "url": run.get("html_url", "")}
+        statuses[wf] = {"conclusion": run.get("conclusion"), "age": a, "created": run.get("created_at", ""), "url": run.get("html_url", ""), "id": run.get("id")}
     if FORCE_TEST:
         print("HEALTHCHECK_FORCE_TEST=1: 合成異常 (失敗+liveness) を注入してアラート経路を検証")
         statuses["__selftest_fail__"] = {"conclusion": "failure", "age": 0.0, "created": now().strftime("%Y-%m-%dT%H:%M:%SZ"), "url": "https://github.com/%s/%s/actions" % (OWNER, PUB_REPO)}
@@ -130,6 +187,9 @@ def main():
         title = title_for(wf)
         problem = detect_problem(wf, st)
         if problem is not None:
+            if st.get("id") and infra_outage(st):
+                print("  ::warning::%s: GitHub 側の Actions 障害と判断し通知を抑制しました (conclusion=%s)。障害が明けても継続していれば次回の毎時チェックで通知します。" % (wf, st["conclusion"]))
+                continue
             if title in issues:
                 print("  既報 (open issue #%s) のため通知 skip: %s" % (issues[title], wf))
                 continue
