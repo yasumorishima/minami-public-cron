@@ -149,12 +149,19 @@ def run_never_started(run_id):
 
 
 def infra_outage(st):
-    """GitHub 側インフラ起因の失敗と判断できるなら True。"""
-    if actions_component_degraded():
-        return True
-    if st.get("conclusion") in BAD and st.get("age", 0) <= SUPPRESS_NEVER_STARTED_MAX_AGE_SEC and run_never_started(st["id"]):
-        return True
-    return False
+    """GitHub 側インフラ起因と判断できるなら True。
+
+    失敗している場合、抑制の必須条件は「1 ステップも実行していない (= ランナー未割当)」。
+    権限不足 / secret drift / Supabase 障害 / スクリプト例外は必ず steps >= 1 になるため、
+    GitHub 障害の最中でも本物の異常は握り潰さない。
+    cron がそもそも起動せず liveness だけが立つケースは失敗 run が無いので status で判断する。
+    """
+    if st.get("conclusion") in BAD:
+        if not run_never_started(st["id"]):
+            return False
+        if st.get("age", 0) <= SUPPRESS_NEVER_STARTED_MAX_AGE_SEC:
+            return True
+    return actions_component_degraded()
 
 
 def detect_problem(wf, st):
