@@ -67,7 +67,7 @@ jobs:
           run_age_sec=0
           for attempt in 1 2 3; do
             latest=$(gh api "repos/${OWNER}/${PROBE_REPO}/actions/workflows/health-check-ack.yml/runs?event=repository_dispatch&per_page=10" \
-              --jq '[.workflow_runs[] | select(.display_title=="health-check" or .name=="Health Check Ack")] | .[0]') || latest=""
+              --jq '[.workflow_runs[] | select(.display_title=="health-check")] | .[0]') || latest=""
             if [ -n "$latest" ] && [ "$latest" != "null" ]; then
               created_at=$(echo "$latest" | jq -r '.created_at')
               run_age_sec=$(( $(date -u +%s) - $(date -u -d "$created_at" +%s) ))
