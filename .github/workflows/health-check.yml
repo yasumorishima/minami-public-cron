@@ -58,19 +58,34 @@ jobs:
         run: |
           set -euo pipefail
           # Get most recent health-check-ack run with action=health-check
-          latest=$(gh api "repos/${OWNER}/${PROBE_REPO}/actions/workflows/health-check-ack.yml/runs?event=repository_dispatch&per_page=10" \
-            --jq '[.workflow_runs[] | select(.display_title=="health-check" or .name=="Health Check Ack")] | .[0]')
-          if [ -z "$latest" ] || [ "$latest" = "null" ]; then
-            echo "::error::No health-check-ack run found at all (workflow not installed?)."
+          # Actions の runs 一覧 API は稀に古いページを返す。 funnies 側の 2026-08-15 05:37 JST の
+          # run では 43 秒前に success していた ack を見落とし 7.2 日前 (age=624957s) を「最新」と
+          # して返し、 job が赤 → 誤メール。 実際は Vercel proxy も GAS も dispatch chain も健全。
+          # 単発の stale read で落とさないよう間を空けて引き直す。 本当に chain が切れていれば
+          # 3 回とも古いままなので検知感度は落ちない (遅延は最悪 +60 秒)。 funnies と parity。
+          created_at=""
+          run_age_sec=0
+          for attempt in 1 2 3; do
+            latest=$(gh api "repos/${OWNER}/${PROBE_REPO}/actions/workflows/health-check-ack.yml/runs?event=repository_dispatch&per_page=10" \
+              --jq '[.workflow_runs[] | select(.display_title=="health-check" or .name=="Health Check Ack")] | .[0]') || latest=""
+            if [ -n "$latest" ] && [ "$latest" != "null" ]; then
+              created_at=$(echo "$latest" | jq -r '.created_at')
+              run_age_sec=$(( $(date -u +%s) - $(date -u -d "$created_at" +%s) ))
+              echo "attempt=$attempt latest_ack_created_at=$created_at age_sec=$run_age_sec"
+              if [ "$run_age_sec" -le 600 ]; then
+                exit 0
+              fi
+            else
+              echo "attempt=$attempt no health-check ack run in listing"
+            fi
+            if [ "$attempt" -lt 3 ]; then sleep 30; fi
+          done
+          if [ -z "$created_at" ]; then
+            echo "::error::No health-check-ack run found at all in 3 consecutive checks (workflow not installed?)."
             exit 1
           fi
-          created_at=$(echo "$latest" | jq -r '.created_at')
-          run_age_sec=$(( $(date -u +%s) - $(date -u -d "$created_at" +%s) ))
-          echo "latest_ack_created_at=$created_at age_sec=$run_age_sec"
-          if [ "$run_age_sec" -gt 600 ]; then
-            echo "::error::Latest health-check-ack ran $run_age_sec seconds ago (>10min). dispatch chain likely broken."
-            exit 1
-          fi
+          echo "::error::Latest health-check-ack ran $run_age_sec seconds ago (>10min) in 3 consecutive checks. dispatch chain likely broken."
+          exit 1
 
       - name: Verify GAS heartbeat freshness (gas-heartbeat-ack)
         env:
