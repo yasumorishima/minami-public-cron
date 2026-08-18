@@ -33,19 +33,37 @@ jobs:
           GAS_WEBHOOK_SECRET: ${{ secrets.GAS_WEBHOOK_SECRET }}
         run: |
           set -euo pipefail
-          payload=$(jq -nc \
-            --arg secret "$GAS_WEBHOOK_SECRET" \
-            --arg ts "$(date -u +%FT%TZ)" \
-            '{secret:$secret, event_type:"health-check", client_payload:{source:"public-cron-health-check", at:$ts}}')
-          http=$(echo "$payload" | curl --max-time 20 -sS -o /tmp/probe-body -w "%{http_code}" \
-            -X POST "$VERCEL_PROXY_URL" \
-            -H "Content-Type: application/json" \
-            --data @-)
-          echo "vercel_proxy_http=$http"
-          head -c 500 /tmp/probe-body || true
-          echo ""
+          # 2026-08-17: GitHub の repository_dispatch API が一過性の 503 を返し、proxy が 502 を
+          # 返しただけで赤くなった (run 32050928879)。同時刻の funnies 側は成功しており全体障害
+          # ではない。1 回目で hard fail せず 3 回まで引き直す。本物の故障 (secret drift / proxy
+          # ダウン) は 3 回とも落ちるので検知感度は変わらない (最悪 +30 秒)。
+          BODY="${RUNNER_TEMP:-.}/probe-body"
+          attempt=0
+          http=""
+          while [ "$attempt" -lt 3 ]; do
+            attempt=$((attempt + 1))
+            : > "$BODY"
+            payload=$(jq -nc \
+              --arg secret "$GAS_WEBHOOK_SECRET" \
+              --arg ts "$(date -u +%FT%TZ)" \
+              '{secret:$secret, event_type:"health-check", client_payload:{source:"public-cron-health-check", at:$ts}}')
+            http=$(echo "$payload" | curl --max-time 20 -sS -o "$BODY" -w "%{http_code}" \
+              -X POST "$VERCEL_PROXY_URL" \
+              -H "Content-Type: application/json" \
+              --data @-) || http="000"
+            echo "attempt=$attempt vercel_proxy_http=$http"
+            head -c 500 "$BODY" || true
+            echo ""
+            if [ "$http" = "200" ]; then
+              if [ "$attempt" -gt 1 ]; then
+                echo "::warning::Vercel proxy probe succeeded on attempt $attempt (an earlier attempt failed with a transient upstream error)."
+              fi
+              break
+            fi
+            if [ "$attempt" -lt 3 ]; then sleep 15; fi
+          done
           if [ "$http" != "200" ]; then
-            echo "::error::Vercel proxy returned HTTP $http (expected 200). Pipeline likely broken: GAS_WEBHOOK_SECRET mismatch, App token, or proxy down."
+            echo "::error::Vercel proxy returned HTTP $http on 3 attempts (expected 200). Pipeline likely broken: GAS_WEBHOOK_SECRET mismatch, App token, or proxy down."
             exit 1
           fi
 
