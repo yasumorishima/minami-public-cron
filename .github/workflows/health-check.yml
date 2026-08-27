@@ -122,7 +122,22 @@ jobs:
             echo "::error::No health-check-ack run found at all in 4 consecutive checks across 2 endpoints (workflow not installed?)."
             exit 1
           fi
-          echo "::error::Newest health-check-ack seen is $best_at ($(( $(date -u +%s) - best_epoch ))s ago) after 4 checks across 2 endpoints. dispatch chain likely broken."
+          # 2026-08-27: GAS のトリガー実行が 12〜19 分遅れ、この待ち窓 (約 2.5 分) に ack が
+          # 間に合わず minami/funnies が同時刻に赤 + メールになった (minami run 32988170647 /
+          # funnies run 32988155344)。chain は生きており ack は 15〜16 分後に success している
+          # (minami 16:40:59Z / funnies 16:38:54Z, dispatch は 16:24Z / 16:23Z)。同じ窓で
+          # gas-heartbeat も 6〜19 分遅れ、17:44Z 以降は定刻に復帰 = Google 側の一過性で
+          # admin に対処できることは無い = 誤報。gas-issue-form の節と同じ流儀にして
+          # 「一過性は warning (ジョブを落とさない = メール抑制)、本物だけ hard fail」にする。
+          # probe は毎時なので chain が本当に切れていれば health-check ack は誰にも更新されず
+          # GAS_HEARTBEAT_MAX_AGE_SEC を超えて老化し、その時点で赤になる。見逃しはせず
+          # 検知が最悪 1 時間遅れるだけ (heartbeat 節が同じ閾値で見ているのと同じ感度)。
+          age_sec=$(( $(date -u +%s) - best_epoch ))
+          if [ "$age_sec" -le "$GAS_HEARTBEAT_MAX_AGE_SEC" ]; then
+            echo "::warning::health-check ack for this probe did not arrive within the wait window; newest ack is $best_at (${age_sec}s ago, still within ${GAS_HEARTBEAT_MAX_AGE_SEC}s). Likely a transient GAS trigger delay; not failing the job."
+            exit 0
+          fi
+          echo "::error::Newest health-check-ack seen is $best_at (${age_sec}s ago, older than ${GAS_HEARTBEAT_MAX_AGE_SEC}s) after 4 checks across 2 endpoints. dispatch chain likely broken."
           exit 1
 
       - name: Verify GAS heartbeat freshness (gas-heartbeat-ack)
