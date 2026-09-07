@@ -75,6 +75,29 @@ jobs:
       - name: Wait for dispatch to land
         run: sleep 45
 
+      - name: Record the last green probe (guards against a lying runs listing)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          # 2026-09-07 funnies run 34152349985: ack は probe の 10 秒後に success していた
+          # (run 34152361028 / display_title=health-check / 18:37:13Z) のに、4 回 x 2 エンドポイント
+          # すべてが 2026-08-07 の run を「最新の ack」と答えて赤になった。per_page 50 + 2 エンド
+          # ポイント併用でも塞げない = 同じ一覧を引き直す方針では原理的に直らない。
+          # そこで「一覧に新しさを尋ねる」のをやめ、この workflow 自身の成功履歴を整合性チェックに使う。
+          # 緑になった run は、その時点で GAS_HEARTBEAT_MAX_AGE_SEC 以内の ack を実際に見ている。
+          # よって best_at がそれより十分古いのは物理的にありえず、chain の断線ではなく一覧の嘘。
+          # この照会自体が stale でも安全側に倒れる (古い last_green -> guard が発火しない -> 従来通り赤)。
+          last_green=$(gh api "repos/${OWNER}/${PROBE_REPO}/actions/workflows/health-check.yml/runs?status=success&per_page=1"             --jq '.workflow_runs[0].created_at' 2>/dev/null             | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' || true)
+          if [ -n "$last_green" ]; then
+            echo "LAST_GREEN_AT=$last_green" >> "$GITHUB_ENV"
+            echo "LAST_GREEN_EPOCH=$(date -u -d "$last_green" +%s)" >> "$GITHUB_ENV"
+          else
+            echo "LAST_GREEN_AT=" >> "$GITHUB_ENV"
+            echo "LAST_GREEN_EPOCH=0" >> "$GITHUB_ENV"
+          fi
+          echo "last_green=${last_green:-<none>}"
+
       - name: Verify health-check-ack workflow ran after this probe
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -137,6 +160,17 @@ jobs:
             echo "::warning::health-check ack for this probe did not arrive within the wait window; newest ack is $best_at (${age_sec}s ago, still within ${GAS_HEARTBEAT_MAX_AGE_SEC}s). Likely a transient GAS trigger delay; not failing the job."
             exit 0
           fi
+          # 一覧が嘘をついていないかを、この workflow 自身の最後の緑で検算する。緑だった run は
+          # その時刻に GAS_HEARTBEAT_MAX_AGE_SEC 以内の ack を見ているので、真の最新 ack は
+          # 少なくとも (最後の緑 - GAS_HEARTBEAT_MAX_AGE_SEC) より新しい。best_at がそれより
+          # さらに 30 分以上古いなら stale read 確定。本物の断線では best_at は最後の緑とほぼ
+          # 同時刻になるのでここは発火せず、従来どおり赤になる = 検知感度は落ちない。
+          last_green_epoch=${LAST_GREEN_EPOCH:-0}
+          stale_floor=$(( last_green_epoch - GAS_HEARTBEAT_MAX_AGE_SEC - 1800 ))
+          if [ "$last_green_epoch" -gt 0 ] && [ "$best_epoch" -lt "$stale_floor" ]; then
+            echo "::warning::runs listing served a stale page: newest health-check ack seen is $best_at, which predates this workflow's own last green run ($LAST_GREEN_AT) by $(( LAST_GREEN_EPOCH - best_epoch ))s. That run went green only because a fresh ack existed then, so the chain is not broken. Not failing the job; the next hourly probe re-checks."
+            exit 0
+          fi
           echo "::error::Newest health-check-ack seen is $best_at (${age_sec}s ago, older than ${GAS_HEARTBEAT_MAX_AGE_SEC}s) after 4 checks across 2 endpoints. dispatch chain likely broken."
           exit 1
 
@@ -171,6 +205,17 @@ jobs:
           done
           if [ "$best_epoch" -eq 0 ]; then
             echo "::warning::No gas-heartbeat run ever seen yet (GAS trigger may not be installed). Skipping freshness check."
+            exit 0
+          fi
+          # 一覧が嘘をついていないかを、この workflow 自身の最後の緑で検算する。緑だった run は
+          # その時刻に GAS_HEARTBEAT_MAX_AGE_SEC 以内の ack を見ているので、真の最新 ack は
+          # 少なくとも (最後の緑 - GAS_HEARTBEAT_MAX_AGE_SEC) より新しい。best_at がそれより
+          # さらに 30 分以上古いなら stale read 確定。本物の断線では best_at は最後の緑とほぼ
+          # 同時刻になるのでここは発火せず、従来どおり赤になる = 検知感度は落ちない。
+          last_green_epoch=${LAST_GREEN_EPOCH:-0}
+          stale_floor=$(( last_green_epoch - GAS_HEARTBEAT_MAX_AGE_SEC - 1800 ))
+          if [ "$last_green_epoch" -gt 0 ] && [ "$best_epoch" -lt "$stale_floor" ]; then
+            echo "::warning::runs listing served a stale page: newest gas-heartbeat seen is $best_at, which predates this workflow's own last green run ($LAST_GREEN_AT) by $(( LAST_GREEN_EPOCH - best_epoch ))s. That run went green only because a fresh ack existed then, so the chain is not broken. Not failing the job; the next hourly probe re-checks."
             exit 0
           fi
           echo "::error::GAS heartbeat is $(( $(date -u +%s) - best_epoch ))s old (>${GAS_HEARTBEAT_MAX_AGE_SEC}s, newest seen $best_at). GAS time trigger may be silently dead (OAuth scope failure pattern)."
