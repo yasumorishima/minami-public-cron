@@ -85,6 +85,7 @@ jobs:
           STATS_COST: ${{ steps.stats.outputs.cost }}
           STATS_TS: ${{ steps.stats.outputs.ts_files }}
           STATS_LOC: ${{ steps.stats.outputs.loc }}
+          STATS_SENSEKI: ${{ steps.stats.outputs.senseki }}
         run: |
           PROFILE_RESP=$(gh api repos/yasumorishima/yasumorishima/contents/README.md)
           echo "$PROFILE_RESP" | jq -r '.content' | base64 -d > /tmp/profile-readme.md
@@ -92,6 +93,10 @@ jobs:
 
           replace_ob() {
             local key="$1" val="$2"
+            if [ "$val" = "KEEP" ]; then
+              echo "  ob:${key}: KEEP (skip)"
+              return 0
+            fi
             local val_esc
             val_esc=$(printf '%s' "$val" | sed 's/[\/&]/\\&/g')
             sed -i "s/<!--ob:${key}-->[^<]*<!--\/ob-->/<!--ob:${key}-->${val_esc}<!--\/ob-->/g" /tmp/profile-readme.md
@@ -104,13 +109,14 @@ jobs:
           replace_ob cost         "$STATS_COST"
           replace_ob ts_files     "$STATS_TS"
           replace_ob loc          "$STATS_LOC"
+          replace_ob senseki      "$STATS_SENSEKI"
 
           # --- Yokohama Funnies stats (<!--fn:-->) read from funnies README markers ---
           replace_fn() {
             local key="$1" val="$2"
             [ -z "$val" ] && return 0
             local val_esc
-            val_esc=$(printf '%s' "$val" | sed 's/[\/&]/\&/g')
+            val_esc=$(printf '%s' "$val" | sed 's/[\/&]/\\&/g')
             sed -i "s/<!--fn:${key}-->[^<]*<!--\/fn-->/<!--fn:${key}-->${val_esc}<!--\/fn-->/g" /tmp/profile-readme.md
           }
           FN_README=$(gh api repos/yasumorishima/yokohama-funnies/contents/README.md -H "Accept: application/vnd.github.raw" 2>/dev/null || echo "")

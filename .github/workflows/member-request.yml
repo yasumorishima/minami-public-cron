@@ -76,6 +76,48 @@ jobs:
           pip install pyyaml -q
           python3 << 'PYTHON'
           import yaml, json, os, subprocess, sys, re, time, urllib.request, urllib.error
+
+          # --- transient (5xx / 通信断) を吸収する urlopen ラッパ (2026-09-12) -------
+          # Supabase API Gateway の 504 が 1 回出ただけで job ごと落ちるのを防ぐ。
+          #   - 冪等な GET/HEAD/PUT/PATCH/DELETE だけ再試行する
+          #   - POST は再試行しない = 二重登録・二重通知メールを作らない
+          #     (sync は冪等なので、次の 5 分刻みの実行が取り返す)
+          #   - 4xx は即座に上げる (権限不足や secret drift を握り潰さない)
+          #     ただし 429 (レート制限) は一過性なので再試行する
+          _TRANSIENT_TRIES = 4
+          _TRANSIENT_SLEEP = 5
+          _TRANSIENT_TIMEOUT = 120
+          _IDEMPOTENT_METHODS = ("GET", "HEAD", "PUT", "PATCH", "DELETE")
+          _real_urlopen = urllib.request.urlopen
+
+
+          def _urlopen_retrying(req, *args, **kwargs):
+              try:
+                  method = req.get_method()
+              except AttributeError:
+                  method = "GET"
+              tries = _TRANSIENT_TRIES if method in _IDEMPOTENT_METHODS else 1
+              if "timeout" not in kwargs and not args:
+                  kwargs["timeout"] = _TRANSIENT_TIMEOUT
+              last = None
+              for i in range(tries):
+                  try:
+                      return _real_urlopen(req, *args, **kwargs)
+                  except urllib.error.HTTPError as e:
+                      if e.code < 500 and e.code != 429:
+                          raise
+                      last = e
+                  except Exception as e:
+                      last = e
+                  if i + 1 < tries:
+                      print("  [retry] %s failed (%s) %d/%d" % (method, last, i + 1, tries))
+                      time.sleep(_TRANSIENT_SLEEP * (i + 1))
+              raise last
+
+
+          urllib.request.urlopen = _urlopen_retrying
+          # -------------------------------------------------------------------------
+
           import textwrap
 
           def normalize_display_name(raw):

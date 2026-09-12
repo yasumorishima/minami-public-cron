@@ -71,15 +71,43 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p config
-          gh api "repos/${PRIVATE_REPO_OWNER}/${PRIVATE_REPO_NAME}/contents/config/members.yml" \
-            -H "Accept: application/vnd.github.raw" > config/members.yml
+          # runner からの一時的なネットワーク断 (dial tcp i/o timeout 等) が 1 回出ただけで
+          # ジョブを fail させない (= 失敗メールを飛ばさない)。404 (rc=44) だけは即確定。
+          api_retry() {
+            local out="$1"; shift
+            local i err="${RUNNER_TEMP}/apierr.txt"
+            for i in 1 2 3 4; do
+              if gh api "$@" > "$out" 2> "$err"; then
+                return 0
+              fi
+              if grep -qi "HTTP 404" "$err"; then
+                return 44
+              fi
+              echo "api attempt ${i} failed: $(head -c 200 "$err")" >&2
+              sleep $((i * 10))
+            done
+            return 1
+          }
+          api_retry config/members.yml \
+            "repos/${PRIVATE_REPO_OWNER}/${PRIVATE_REPO_NAME}/contents/config/members.yml" \
+            -H "Accept: application/vnd.github.raw" || { echo "::error::members.yml を取得できませんでした"; exit 1; }
           wc -c config/members.yml
           mkdir -p config/members
-          _files=$(gh api "repos/${PRIVATE_REPO_OWNER}/${PRIVATE_REPO_NAME}/contents/config/members" --jq '.[]?.name' 2>/dev/null || true)
+          _list_rc=0
+          api_retry "${RUNNER_TEMP}/members_list.json" \
+            "repos/${PRIVATE_REPO_OWNER}/${PRIVATE_REPO_NAME}/contents/config/members" || _list_rc=$?
+          _files=""
+          if [ "$_list_rc" = "0" ]; then
+            _files=$(jq -r '.[]?.name // empty' "${RUNNER_TEMP}/members_list.json")
+          elif [ "$_list_rc" != "44" ]; then
+            echo "::error::failed to list config/members after retries"; exit 1
+          fi
           for _f in $_files; do
             case "$_f" in
               *.yml|*.yaml)
-                gh api "repos/${PRIVATE_REPO_OWNER}/${PRIVATE_REPO_NAME}/contents/config/members/${_f}" -H "Accept: application/vnd.github.raw" > "config/members/${_f}" ;;
+                api_retry "config/members/${_f}" \
+                  "repos/${PRIVATE_REPO_OWNER}/${PRIVATE_REPO_NAME}/contents/config/members/${_f}" \
+                  -H "Accept: application/vnd.github.raw" || { echo "::error::failed to fetch ${_f}"; exit 1; } ;;
             esac
           done
           echo "per-file count: $(ls -1 config/members/ 2>/dev/null | wc -l)"
@@ -95,7 +123,49 @@ jobs:
           pip install pyyaml -q
 
           python3 << 'PYTHON'
-          import yaml, json, os, re, glob, urllib.request, urllib.error
+          import yaml, json, os, re, glob, time, urllib.request, urllib.error
+
+          # --- transient (5xx / 通信断) を吸収する urlopen ラッパ (2026-09-12) -------
+          # Supabase API Gateway の 504 が 1 回出ただけで job ごと落ちるのを防ぐ。
+          #   - 冪等な GET/HEAD/PUT/PATCH/DELETE だけ再試行する
+          #   - POST は再試行しない = 二重登録・二重通知メールを作らない
+          #     (sync は冪等なので、次の 5 分刻みの実行が取り返す)
+          #   - 4xx は即座に上げる (権限不足や secret drift を握り潰さない)
+          #     ただし 429 (レート制限) は一過性なので再試行する
+          _TRANSIENT_TRIES = 4
+          _TRANSIENT_SLEEP = 5
+          _TRANSIENT_TIMEOUT = 120
+          _IDEMPOTENT_METHODS = ("GET", "HEAD", "PUT", "PATCH", "DELETE")
+          _real_urlopen = urllib.request.urlopen
+
+
+          def _urlopen_retrying(req, *args, **kwargs):
+              try:
+                  method = req.get_method()
+              except AttributeError:
+                  method = "GET"
+              tries = _TRANSIENT_TRIES if method in _IDEMPOTENT_METHODS else 1
+              if "timeout" not in kwargs and not args:
+                  kwargs["timeout"] = _TRANSIENT_TIMEOUT
+              last = None
+              for i in range(tries):
+                  try:
+                      return _real_urlopen(req, *args, **kwargs)
+                  except urllib.error.HTTPError as e:
+                      if e.code < 500 and e.code != 429:
+                          raise
+                      last = e
+                  except Exception as e:
+                      last = e
+                  if i + 1 < tries:
+                      print("  [retry] %s failed (%s) %d/%d" % (method, last, i + 1, tries))
+                      time.sleep(_TRANSIENT_SLEEP * (i + 1))
+              raise last
+
+
+          urllib.request.urlopen = _urlopen_retrying
+          # -------------------------------------------------------------------------
+
 
           SUPABASE_URL = os.environ["SUPABASE_URL"]
           KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
@@ -159,54 +229,59 @@ jobs:
           updated = 0
           created = 0
 
-          for uid, target_role in all_uids.items():
-              meta = uid_meta.get(uid, {})
-              grad = meta.get("graduation_class")
+          _sync_error = None
+          try:
+              for uid, target_role in all_uids.items():
+                  meta = uid_meta.get(uid, {})
+                  grad = meta.get("graduation_class")
 
-              if uid in existing_map:
-                  current = existing_map[uid]
-                  changes = {}
-                  role_changed_from = None
-                  if current["role"] != target_role:
-                      changes["role"] = target_role
-                      role_changed_from = current["role"]
-                  if grad and not current.get("graduation_class"):
-                      changes["graduation_class"] = grad
-                  if changes:
-                      row_id = current["id"]
+                  if uid in existing_map:
+                      current = existing_map[uid]
+                      changes = {}
+                      role_changed_from = None
+                      if current["role"] != target_role:
+                          changes["role"] = target_role
+                          role_changed_from = current["role"]
+                      if grad and not current.get("graduation_class"):
+                          changes["graduation_class"] = grad
+                      if changes:
+                          row_id = current["id"]
+                          url = f"{SUPABASE_URL}/rest/v1/user_roles?id=eq.{row_id}"
+                          body = json.dumps(changes).encode()
+                          req = urllib.request.Request(url, data=body, headers=HEADERS, method="PATCH")
+                          urllib.request.urlopen(req)
+                          print(f"  Updated {uid[:8]}: {changes}")
+                          updated += 1
+                          if role_changed_from is not None:
+                              change_type = "created" if role_changed_from == "viewer" else "upgraded"
+                              notify_queue.append((uid, target_role, change_type, grad or current.get("graduation_class") or ""))
+                  else:
+                      url = f"{SUPABASE_URL}/rest/v1/user_roles"
+                      payload = {"user_id": uid, "role": target_role}
+                      if grad:
+                          payload["graduation_class"] = grad
+                      body = json.dumps(payload).encode()
+                      req = urllib.request.Request(url, data=body, headers=HEADERS, method="POST")
+                      urllib.request.urlopen(req)
+                      print(f"  Created {uid[:8]}: {target_role}")
+                      created += 1
+                      notify_queue.append((uid, target_role, "created", grad or ""))
+
+              for uid, role_info in existing_map.items():
+                  if uid not in all_uids and role_info["role"] != "viewer":
+                      if SKIP_DEMOTIONS:
+                          print("  [guard] demote skipped: " + uid[:8]); continue
+                      row_id = role_info["id"]
                       url = f"{SUPABASE_URL}/rest/v1/user_roles?id=eq.{row_id}"
-                      body = json.dumps(changes).encode()
+                      body = json.dumps({"role": "viewer"}).encode()
                       req = urllib.request.Request(url, data=body, headers=HEADERS, method="PATCH")
                       urllib.request.urlopen(req)
-                      print(f"  Updated {uid[:8]}: {changes}")
+                      print(f"  Demoted {uid[:8]}: {role_info['role']} -> viewer")
                       updated += 1
-                      if role_changed_from is not None:
-                          change_type = "created" if role_changed_from == "viewer" else "upgraded"
-                          notify_queue.append((uid, target_role, change_type, grad or current.get("graduation_class") or ""))
-              else:
-                  url = f"{SUPABASE_URL}/rest/v1/user_roles"
-                  payload = {"user_id": uid, "role": target_role}
-                  if grad:
-                      payload["graduation_class"] = grad
-                  body = json.dumps(payload).encode()
-                  req = urllib.request.Request(url, data=body, headers=HEADERS, method="POST")
-                  urllib.request.urlopen(req)
-                  print(f"  Created {uid[:8]}: {target_role}")
-                  created += 1
-                  notify_queue.append((uid, target_role, "created", grad or ""))
 
-          for uid, role_info in existing_map.items():
-              if uid not in all_uids and role_info["role"] != "viewer":
-                  if SKIP_DEMOTIONS:
-                      print("  [guard] demote skipped: " + uid[:8]); continue
-                  row_id = role_info["id"]
-                  url = f"{SUPABASE_URL}/rest/v1/user_roles?id=eq.{row_id}"
-                  body = json.dumps({"role": "viewer"}).encode()
-                  req = urllib.request.Request(url, data=body, headers=HEADERS, method="PATCH")
-                  urllib.request.urlopen(req)
-                  print(f"  Demoted {uid[:8]}: {role_info['role']} -> viewer")
-                  updated += 1
-
+          except Exception as _e:
+              _sync_error = _e
+              print("::warning::role sync が途中で中断しました (%s)。保留中の承認通知を先に送ってから失敗させます。" % _e)
           print(f"\n✅ Done: {created} created, {updated} updated")
 
           if notify_queue and GAS_WEBHOOK_URL and GAS_WEBHOOK_SECRET:
@@ -255,4 +330,8 @@ jobs:
                   print(f"::warning::notification block failed (role sync already succeeded): {e}")
           elif notify_queue:
               print(f"  ℹ️ {len(notify_queue)} notifications skipped (GAS_WEBHOOK_URL/SECRET not set)")
+
+          if _sync_error is not None:
+              print("::error::role sync は途中で中断しました (通知の送信は完了しています)。")
+              raise _sync_error
           PYTHON

@@ -24,35 +24,89 @@ jobs:
           CUTOFF=$(date -u -d "${PURGE_DAYS} days ago" +%Y-%m-%dT%H:%M:%S)
           echo "Cutoff: ${CUTOFF}"
 
-          RESPONSE=$(curl -sS -X GET \
-            "${SUPABASE_URL}/rest/v1/photos?deleted_at=not.is.null&deleted_at=lt.${CUTOFF}&select=id,storage_path" \
-            -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
-            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}")
+          set -uo pipefail
+          BODY="${RUNNER_TEMP:-/tmp}/photos.json"
+          HTTP_CODE=$(curl -sS --max-time 60 -o "$BODY" -w '%{http_code}' -X GET "${SUPABASE_URL}/rest/v1/photos?deleted_at=not.is.null&deleted_at=lt.${CUTOFF}&select=id,storage_path" -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}") || HTTP_CODE=000
+          RESPONSE=$(cat "$BODY" 2>/dev/null || echo "")
 
-          COUNT=$(echo "$RESPONSE" | jq length)
+          # 読めなかったら黙って成功しない (2026-09-12: Supabase 504 で silent no-op だった)
+          case "$HTTP_CODE" in
+            2*) ;;
+            *)
+              echo "::error::photos の取得に失敗 (HTTP ${HTTP_CODE})。purge は 1 件も実行していません。"
+              head -c 300 "$BODY" 2>/dev/null
+              exit 1
+              ;;
+          esac
+          COUNT=$(printf '%s' "$RESPONSE" | jq length 2>/dev/null || echo "")
+          case "$COUNT" in
+            ""|*[!0-9]*)
+              echo "::error::photos の応答が JSON 配列ではありません。purge は 1 件も実行していません。"
+              printf '%s' "$RESPONSE" | head -c 300
+              exit 1 ;;
+          esac
           echo "Found $COUNT photos to purge"
 
           if [ "$COUNT" -eq 0 ]; then
             echo "✅ No photos to purge"
           else
-            # Storage から削除
-            PATHS=$(echo "$RESPONSE" | jq -r '.[].storage_path')
-            for path in $PATHS; do
-              HTTP_CODE=$(curl -sS -o /dev/null -w "%{http_code}" -X DELETE \
-                "${SUPABASE_URL}/storage/v1/object/photos/${path}" \
-                -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
-                -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}")
+            # Storage から削除し、消えた行だけ DB から消す (孤児化を防ぐ)
+            DEL_FAILED=0
+            # 404 を「既に無い」と読んでよいのは storage の管理権限がある時だけ。
+            # 権限不足でも Supabase は 404 を返す (公式 error-codes: not found or
+            # you do not have the correct permission)。先に確かめ、確かめられなければ
+            # 1 件も消さずに止める。
+            BK_CODE=$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}' "${SUPABASE_URL}/storage/v1/bucket/photos" -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}") || BK_CODE=000
+            case "$BK_CODE" in
+              2*) ;;
+              *)
+                echo "::error::storage の管理権限を確認できません (HTTP ${BK_CODE})。404 を成功扱いできないため purge を中止します。"
+                exit 1 ;;
+            esac
+            PROCESSED=0
+            ROWS_FILE="${RUNNER_TEMP:-/tmp}/purge_rows.txt"
+            # 空白・改行を含むパスは行の形を壊すので自動削除しない
+            echo "$RESPONSE" | jq -r '.[] | select(.storage_path != null and (.storage_path | test("[[:space:]]") | not)) | .id + " " + .storage_path' > "$ROWS_FILE"
+            WANT=$(wc -l < "$ROWS_FILE")
+            BAD=$((COUNT - WANT))
+            if [ "$BAD" -gt 0 ]; then
+              echo "::error::${BAD} 件の storage_path が空白/改行/null を含むため自動削除しません。"
+              DEL_FAILED=$((DEL_FAILED + BAD))
+            fi
+            while IFS= read -r row; do
+              [ -n "$row" ] || continue
+              id="${row%% *}"
+              path="${row#* }"
+              PROCESSED=$((PROCESSED + 1))
+              if [ -z "$id" ] || [ -z "$path" ] || [ "$id" = "$path" ]; then
+                echo "::error::行の形が不正です: [${row}]"
+                DEL_FAILED=$((DEL_FAILED + 1))
+                continue
+              fi
+              HTTP_CODE=$(curl -sS --max-time 60 -o /dev/null -w "%{http_code}" -X DELETE "${SUPABASE_URL}/storage/v1/object/photos/${path}" -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}") || HTTP_CODE=000
               echo "Storage delete ${path}: HTTP ${HTTP_CODE}"
-            done
-
-            # DB レコード削除
-            IDS=$(echo "$RESPONSE" | jq -r '.[].id')
-            for id in $IDS; do
-              curl -sS -o /dev/null -w "DB delete photo ${id}: HTTP %{http_code}\n" -X DELETE \
-                "${SUPABASE_URL}/rest/v1/photos?id=eq.${id}" \
-                -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
-                -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}"
-            done
+              # 404 = 既に無い = 目的は達成。それ以外の失敗では DB 行を残す
+              # (消すと storage の実体が辿れない孤児になるため)。
+              case "$HTTP_CODE" in
+                2*|404) ;;
+                *)
+                  DEL_FAILED=$((DEL_FAILED + 1))
+                  echo "  -> DB 行 ${id} は残します (次回再試行)"
+                  continue ;;
+              esac
+              HTTP_CODE=$(curl -sS --max-time 60 -o /dev/null -w "%{http_code}" -X DELETE "${SUPABASE_URL}/rest/v1/photos?id=eq.${id}" -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}") || HTTP_CODE=000
+              echo "DB delete photo ${id}: HTTP ${HTTP_CODE}"
+              case "$HTTP_CODE" in 2*) ;; *) DEL_FAILED=$((DEL_FAILED + 1)) ;; esac
+            done < "$ROWS_FILE"
+            # 出力した行数と処理した行数が合わなければ、成功したことにしない
+            if [ "$PROCESSED" != "$WANT" ]; then
+              echo "::error::${WANT} 行に対し ${PROCESSED} 行しか処理していません。"
+              exit 1
+            fi
+            if [ "$DEL_FAILED" -gt 0 ]; then
+              echo "::error::${DEL_FAILED} 件の削除が失敗しました (対象は残るので次回再試行されます)"
+              exit 1
+            fi
             echo "✅ Purged $COUNT photos"
           fi
 
@@ -60,18 +114,28 @@ jobs:
         run: |
           CUTOFF=$(date -u -d "${PURGE_DAYS} days ago" +%Y-%m-%dT%H:%M:%S)
 
+          TBL_FAILED=0
           for TABLE in results schedule announcements members_posts golf_competitions dues_payments; do
-            HTTP_CODE=$(curl -sS -o /tmp/purge_${TABLE}.json -w "%{http_code}" -X DELETE \
+            HTTP_CODE=$(curl -sS --max-time 60 -o /tmp/purge_${TABLE}.json -w "%{http_code}" -X DELETE \
               "${SUPABASE_URL}/rest/v1/${TABLE}?deleted_at=not.is.null&deleted_at=lt.${CUTOFF}" \
               -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
               -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
-              -H "Prefer: return=representation")
+              -H "Prefer: return=representation") || HTTP_CODE=000
 
-            if [ "$HTTP_CODE" = "200" ]; then
-              COUNT=$(cat /tmp/purge_${TABLE}.json | jq length)
-              echo "✅ ${TABLE}: purged ${COUNT} records"
-            else
-              echo "⚠️ ${TABLE}: HTTP ${HTTP_CODE}"
-              cat /tmp/purge_${TABLE}.json
-            fi
+            case "$HTTP_CODE" in
+              2*)
+                COUNT=$(cat /tmp/purge_${TABLE}.json | jq length)
+                echo "✅ ${TABLE}: purged ${COUNT} records"
+                ;;
+              *)
+                echo "::error::${TABLE}: HTTP ${HTTP_CODE}"
+                cat /tmp/purge_${TABLE}.json
+                TBL_FAILED=$((TBL_FAILED + 1))
+                ;;
+            esac
           done
+
+          if [ "$TBL_FAILED" -gt 0 ]; then
+            echo "::error::${TBL_FAILED} テーブルの purge が失敗しました"
+            exit 1
+          fi
