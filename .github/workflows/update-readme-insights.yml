@@ -1,0 +1,34 @@
+name: Update README Access Stats
+
+# 南高OB会・横浜ファニーズの公開 docs README に、アクセス数の行と図 2 枚を毎日書く。
+# 取得元は各サイトの /api/insights-summary（/insights と同じ GA4 集計・鍵不要）。
+# 書き込みは update-readme-stats.yml と同じ DOCS_SYNC_PAT（両 docs リポジトリの contents:write）。
+
+on:
+  schedule:
+    - cron: '17 21 * * *'  # 毎日 JST 6:17（前日までの日別が確定してから）
+  workflow_dispatch:
+    inputs:
+      memo:
+        description: "実行メモ"
+        required: false
+
+permissions: {}
+
+concurrency:
+  group: readme-insights
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Write access stats to both docs READMEs
+        env:
+          GH_TOKEN: ${{ secrets.DOCS_SYNC_PAT }}
+        run: python3 scripts/readme-insights.py
