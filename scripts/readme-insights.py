@@ -205,6 +205,37 @@ def monthly_series(data, site, today):
     return months[-24:]
 
 
+def compare(new, old):
+    """「12%多い」「26%少ない」「同じ」。比べる相手が 0 なら None。"""
+    if old <= 0:
+        return None
+    pct = round(100 * (new - old) / old)
+    if pct == 0:
+        return "ほぼ同じ"
+    return f"{abs(pct)}%{'多い' if pct > 0 else '少ない'}"
+
+
+def daily_title(days):
+    """題名で結論を言う: 直近 30 日（昨日まで）を、その前の 30 日と比べる。"""
+    v = [x for _, x in days]
+    if len(v) >= 60:
+        c = compare(sum(v[-30:]), sum(v[-60:-30]))
+        if c:
+            return f"直近30日の閲覧数は、その前の30日より{c}"
+    return f"日別の閲覧数（直近{len(days)}日）"
+
+
+def monthly_title(months, partial):
+    """題名で結論を言う: 最後の丸 1 か月を、その前の丸 1 か月と比べる。"""
+    full = [(k, v) for i, (k, v) in enumerate(months) if i not in partial]
+    if len(full) >= 2:
+        (k0, v0), (k1, v1) = full[-2], full[-1]
+        c = compare(v1, v0)
+        if c:
+            return f"{int(k1[5:])}月の閲覧数は{int(k0[5:])}月より{c}"
+    return "月別の閲覧数"
+
+
 def render(data, site, today):
     days = daily_series(data, site, today)
     dticks = {i: f"{d.month}/{d.day}" for i, (d, _) in enumerate(days) if d.day == 1}
@@ -226,10 +257,10 @@ def render(data, site, today):
     files = {}
     for th in THEMES:
         files[f"insights/daily-{th}.svg"] = bar_svg(
-            f"日別の閲覧数（直近{len(days)}日）", [d.isoformat() for d, _ in days],
+            daily_title(days), [d.isoformat() for d, _ in days],
             [v for _, v in days], dticks, th)
         files[f"insights/monthly-{th}.svg"] = bar_svg(
-            "月別の閲覧数", ml, [v for _, v in months], mticks, th,
+            monthly_title(months, partial), ml, [v for _, v in months], mticks, th,
             partial, value_labels=True, subtitle="・".join(notes) + "（色の淡い棒）")
     return files
 
