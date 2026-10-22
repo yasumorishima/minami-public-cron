@@ -81,11 +81,31 @@ def open_monitor_issues():
     return out
 
 
+def superseded_in_queue(run):
+    """concurrency の順番待ち中に後続 run と入れ替わった cancelled なら True。
+    job が 1 つも作られていない = 何も実行していないので異常ではない
+    (2026-10-22: ランナー待ちで前の run が 1 時間詰まり、待っていた run が cancelled になってメールが飛んだ)。
+    job 一覧を取れなければ False (= 従来どおり異常として扱う)。
+    これが続いて本当に何も走らなくなった場合は liveness が検出する。"""
+    if run.get("conclusion") != "cancelled":
+        return False
+    try:
+        data = gh("/repos/%s/%s/actions/runs/%s/jobs?per_page=1" % (OWNER, PUB_REPO, run.get("id")), PROBE_TOKEN)
+    except Exception as e:
+        print("  ::warning::job 一覧の取得失敗 (%s) — cancelled を異常として扱います" % e)
+        return False
+    return data.get("total_count", 0) == 0 and not data.get("jobs")
+
+
 def latest_completed_run(wf):
     data = gh("/repos/%s/%s/actions/workflows/%s/runs?per_page=10" % (OWNER, PUB_REPO, wf), PROBE_TOKEN)
     for run in data.get("workflow_runs", []):
-        if run.get("status") == "completed":
-            return run
+        if run.get("status") != "completed":
+            continue
+        if superseded_in_queue(run):
+            print("%s: run %s は順番待ち中に後続と入れ替わった cancelled (job なし) のため飛ばします" % (wf, run.get("id")))
+            continue
+        return run
     return None
 
 
