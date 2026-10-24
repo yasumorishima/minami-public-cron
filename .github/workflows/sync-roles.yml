@@ -10,12 +10,6 @@ on:
         required: false
   repository_dispatch:
     types: [sync-roles]
-  # cloud セッション（claude.ai/code）は workflow を起動できない（403）ので、
-  # claude/ops-* ブランチへ requests/sync-roles.json を push したら回す。
-  # このファイルの中身は読まない。名前など個人の情報を書かない（public repo）。
-  push:
-    branches: ["claude/ops-*"]
-    paths: ["requests/sync-roles.json"]
 
 permissions:
   contents: read

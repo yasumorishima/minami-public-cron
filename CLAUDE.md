@@ -16,18 +16,15 @@
 | file | 起動 | 役割 |
 |---|---|---|
 | `member-request.yml` | `repository_dispatch` | 入会申請から private repo に `config/members/<uid>.yml` の PR を作り、`user_roles` の承認待ち行（氏名・期）を書く |
-| `sync-roles.yml` | 5 分おき・手動・dispatch・下の push | private repo の `config/members*.yml` を読んで role を同期。承認メールも |
+| `sync-roles.yml` | 5 分おき・手動・dispatch | private repo の `config/members*.yml` を読んで role を同期。承認メールも |
 | `health-check.yml` / `-ack.yml` | 毎時 / dispatch | 会員パイプラインの監視（異常時だけ private repo に Issue とメール） |
 | `daily-message.yml` | 30 分おき | 「今日のひとこと」の API を呼ぶ |
 | `keep-alive.yml` / `purge-deleted-photos.yml` / `warm-weather.yml` | 週 1 / 毎日 / 30 分おき | 休止防止 / 論理削除 7 日後の物理削除 / 天気キャッシュ |
 | `update-readme-stats.yml` / `update-readme-insights.yml` | 毎月 1 日 / 毎日 | README の統計 / 公開 docs の参照元の図 |
 
-## sync-roles をすぐ回す（cloud から）
-- ブランチ `claude/ops-YYYYMMDD` に **`requests/sync-roles.json`** を push すると sync-roles が起動する。
-  ```json
-  {"memo": "PR 承認後の即時同期", "at": "2026-10-24T10:00:00+09:00"}
-  ```
-- 中身は memo と時刻だけ。**名前・UID・PR の中身は書かない**。このブランチは main へ merge しない。前後の手順は private 側 `CLAUDE.md` の「会員承認（3 段）」。
+## sync-roles の即時起動
+- 会員承認の直後の即時同期は、private の実行役 `yasumorishima/site-ops` が `workflow_dispatch` で起動する（cloud セッションから直接は起動できない）。
+- ⛔ `push` などブランチ上で動く起動条件を足さない。ブランチの workflow は repo の Secrets を読めるので、cloud セッションが workflow を書き換えれば鍵に届く（2026-10-24 にいったん足して戻した）。
 
 ## Session protocol
 - 返答は日本語・です/ます。走らせていないこと・確かめていないことは書かない。
