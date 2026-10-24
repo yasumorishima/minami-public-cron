@@ -24,7 +24,8 @@
 
 ## sync-roles の即時起動
 - 会員承認の直後の即時同期は、private の実行役 `yasumorishima/site-ops` が `workflow_dispatch` で起動する（cloud セッションから直接は起動できない）。
-- ⛔ `push` などブランチ上で動く起動条件を足さない。ブランチの workflow は repo の Secrets を読めるので、cloud セッションが workflow を書き換えれば鍵に届く（2026-10-24 にいったん足して戻した）。
+- ⛔ `push` などブランチ上で動く起動条件を足さない（2026-10-24 にいったん足して戻した）。
+- ⚠️ ただし、それだけでは鍵は守れない。cloud セッションがこの repo につながれていれば、ブランチに workflow を1 本足すだけで repo の Secrets（Supabase の service role キー・GitHub App の秘密鍵）を読める。鍵の置き場所の見直しは 2026-10-24 時点で未了。
 
 ## Session protocol
 - 返答は日本語・です/ます。走らせていないこと・確かめていないことは書かない。
