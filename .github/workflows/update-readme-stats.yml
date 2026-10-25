@@ -17,6 +17,8 @@ jobs:
     steps:
       - name: Checkout cron repo (this repo for scripts/)
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Checkout minami-baseball-ob (private)
         uses: actions/checkout@v4
@@ -24,12 +26,22 @@ jobs:
           repository: yasumorishima/minami-baseball-ob
           token: ${{ secrets.DOCS_SYNC_PAT }}
           path: ob-source
+          # .git/config にトークンを残さない（README を symlink にされると読まれる）
+          persist-credentials: false
 
-      - name: Run stats script
-        id: stats
+      - name: Count DB rows (the only step with the Supabase key; does not read the site clone)
+        id: db
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: bash scripts/count-db-rows.sh
+
+      - name: Run stats script
+        id: stats
+        # サイトの clone を読み書きする step には鍵を渡さない
+        env:
+          SENSEKI: ${{ steps.db.outputs.senseki }}
+          ACTIVE_USERS: ${{ steps.db.outputs.active_users }}
         run: bash scripts/update-readme-stats.sh ./ob-source
 
       - name: Sync README to minami-baseball-ob
@@ -61,7 +73,7 @@ jobs:
 
           for key in ts_files loc pages apis components tables_main tables_hist migrations workflows senseki; do
             value=$(grep -oP "<!--stat:${key}-->\K[^<]*" ob-source/README.md | head -1)
-            if [ -n "$value" ]; then
+            if [[ "$value" =~ ^~?[0-9][0-9,]*$ ]]; then
               sed -i "s/<!--stat:${key}-->[^<]*<!--\/stat-->/<!--stat:${key}-->${value}<!--\/stat-->/g" /tmp/docs-readme.md
             fi
           done
@@ -114,7 +126,7 @@ jobs:
           # --- Yokohama Funnies stats (<!--fn:-->) read from funnies README markers ---
           replace_fn() {
             local key="$1" val="$2"
-            [ -z "$val" ] && return 0
+            [[ "$val" =~ ^~?[0-9][0-9,]*$ ]] || return 0
             local val_esc
             val_esc=$(printf '%s' "$val" | sed 's/[\/&]/\\&/g')
             sed -i "s/<!--fn:${key}-->[^<]*<!--\/fn-->/<!--fn:${key}-->${val_esc}<!--\/fn-->/g" /tmp/profile-readme.md
@@ -126,7 +138,8 @@ jobs:
             replace_fn loc      "$(printf '%s' "$FN_README" | grep -oP '<!--stat:loc-->\K[^<]*' | head -1)"
             FN_TM=$(printf '%s' "$FN_README" | grep -oP '<!--stat:tables_main-->\K[^<]*' | head -1)
             FN_TH=$(printf '%s' "$FN_README" | grep -oP '<!--stat:tables_hist-->\K[^<]*' | head -1)
-            [ -n "$FN_TM" ] && [ -n "$FN_TH" ] && replace_fn db_tables "$((FN_TM + FN_TH))"
+            # 算術の前に数字だけか確かめる（$(( )) は値を式として評価し a[$(cmd)] を実行する）
+            [[ "$FN_TM" =~ ^[0-9]+$ && "$FN_TH" =~ ^[0-9]+$ ]] && replace_fn db_tables "$((10#$FN_TM + 10#$FN_TH))"
             echo "funnies fn: markers updated"
           else
             echo "::warning::could not read funnies README (DOCS_SYNC_PAT access?) - fn: markers unchanged"
@@ -145,10 +158,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.DOCS_SYNC_PAT }}
         run: |
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import subprocess, json, re, binascii
           fn = subprocess.run(["gh","api","repos/yasumorishima/yokohama-funnies/contents/README.md","-H","Accept: application/vnd.github.raw"],capture_output=True,text=True).stdout
-          stats = dict(re.findall(r"<!--stat:([a-z_]+)-->([^<]*)<!--/stat-->", fn))
+          stats = {k: v for k, v in re.findall(r"<!--stat:([a-z_]+)-->([^<]*)<!--/stat-->", fn) if re.fullmatch(r"~?[0-9][0-9,]*", v)}
           dr = subprocess.run(["gh","api","repos/yasumorishima/yokohama-funnies-docs/contents/README.md"],capture_output=True,text=True)
           if not stats or dr.returncode != 0:
               print("::warning::funnies stats or docs read failed (DOCS_SYNC_PAT access?)")

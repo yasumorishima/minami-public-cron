@@ -122,7 +122,8 @@ jobs:
           set -euo pipefail
           pip install pyyaml -q
 
-          python3 << 'PYTHON'
+          # -P: カレントを import の探し先に入れない（member-request と同じ）
+          python3 -P << 'PYTHON'
           import yaml, json, os, re, glob, time, urllib.request, urllib.error
 
           # --- transient (5xx / 通信断) を吸収する urlopen ラッパ (2026-09-12) -------
