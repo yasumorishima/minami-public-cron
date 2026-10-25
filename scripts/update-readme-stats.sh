@@ -15,43 +15,12 @@ MIGRATIONS=$(ls supabase/migrations/*.sql 2>/dev/null | wc -l | tr -d ' ')
 WORKFLOWS=$(ls .github/workflows/*.yml 2>/dev/null | wc -l | tr -d ' ')
 E2E_TESTS=$(find e2e -name '*.spec.ts' 2>/dev/null | wc -l | tr -d ' ')
 
-# Supabase REST で計測 — 失敗時は KEEP 返却（呼出側で marker 更新 skip）
-# HTTP code 表示 + max-time 60 + non-2xx は KEEP
-fetch_count() {
-  local table="$1" filter="${2:-}"
-  local url="$SUPABASE_URL/rest/v1/$table?select=id"
-  [ -n "$filter" ] && url="$url&$filter"
-  local resp http_code count
-  resp=$(curl --max-time 60 -sS -D - -o /dev/null -w 'HTTP_STATUS:%{http_code}\n' \
-    "$url" \
-    -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
-    -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
-    -H "Prefer: count=exact" \
-    -H "Range: 0-0" 2>&1) || { echo "DEBUG $table curl failed" >&2; echo KEEP; return; }
-  http_code=$(printf '%s' "$resp" | grep '^HTTP_STATUS:' | sed 's/HTTP_STATUS://')
-  count=$(printf '%s' "$resp" | grep -i '^content-range:' | sed -E 's/.*\///' | tr -d '\r\n ')
-  echo "DEBUG $table http=$http_code count=$count" >&2
-  # HTTP 2xx かつ count が数値の場合のみ実値返却、それ以外は KEEP
-  if [ -z "$http_code" ] || [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
-    echo KEEP
-  elif [ -z "$count" ] || ! [[ "$count" =~ ^[0-9]+$ ]]; then
-    echo KEEP
-  else
-    echo "$count"
-  fi
-}
-
-if [ -n "${SUPABASE_URL:-}" ] && [ -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]; then
-  SENSEKI=$(fetch_count history_matches)
-  ACTIVE_USERS=$(fetch_count user_roles 'role=neq.viewer')
-else
-  echo "DEBUG SUPABASE secrets missing" >&2
-  SENSEKI=KEEP
-  ACTIVE_USERS=KEEP
-fi
+# Supabase の件数は前の step（scripts/count-db-rows.sh）が取って env で渡す。この script は鍵を使わない
+SENSEKI="${SENSEKI:-KEEP}"; [[ "$SENSEKI" =~ ^[0-9]+$ ]] || SENSEKI=KEEP
+ACTIVE_USERS="${ACTIVE_USERS:-KEEP}"; [[ "$ACTIVE_USERS" =~ ^[0-9]+$ ]] || ACTIVE_USERS=KEEP
 
 TS_FILES=$(find app components lib -name '*.ts' -o -name '*.tsx' | wc -l | tr -d ' ')
-LOC=$(find app components lib -name '*.ts' -o -name '*.tsx' -exec cat {} + | wc -l | tr -d ' ')
+LOC=$(find app components lib \( -name '*.ts' -o -name '*.tsx' \) -exec cat {} + | wc -l | tr -d ' ')
 LOC_APPROX=$(( (LOC / 100) * 100 ))
 
 # テーブル数: CREATE TABLE - DROP TABLE
@@ -85,6 +54,13 @@ replace_stat() {
   fi
   sed -i "s/<!--stat:${key}-->[^<]*<!--\/stat-->/<!--stat:${key}-->${value}<!--\/stat-->/g" "$file"
 }
+
+# README.md が symlink（や通常のファイル以外）なら止まる。sed -i はリンク先を読んで普通のファイルに書き戻すので、
+# `README.md -> .git/config` や `-> /proc/self/environ` を commit されると、トークンや環境変数が README に入って push される。
+if [ -L README.md ] || { [ -e README.md ] && [ ! -f README.md ]; }; then
+  echo "::error::README.md が通常のファイルではありません（symlink 等）。書き換えません" >&2
+  exit 1
+fi
 
 # --- ob-source/README.md 更新 (既存 markers) ---
 for readme in README.md; do

@@ -15,7 +15,6 @@
 | `warm-weather.yml` | `*/30 * * * *` | minami の `/weather` を HTTP GET で warm、 Vercel Data Cache を refresh |
 | `keep-alive.yml` | `0 0 * * 0` (週次) | `/schedule` を HTTP GET して SSR 経由で Supabase fetch を起こし、 Free plan の 7 日無活動 auto-pause を回避 (anon key 不要) |
 | `purge-deleted-photos.yml` | `0 19 * * *` (毎日 JST 4:00) + dispatch | soft-delete >7日の photos を Supabase Storage+DB から物理削除 + content テーブル purge (2026-05-30 private repo から移行) |
-| `check-current-team.yml` | `0 10 * * 1` (週次月曜) + dispatch | App token で minami-baseball-ob を clone し Playwright で新着試合を scrape → Supabase 登録 → private repo に issue 通知 (2026-05-30 移行) **現在 `disabled_manually`**: 日次化した実装は private repo 側にあり、 こちらを有効化すると PR が二重に立つ |
 | `daily-message.yml` | `*/30 * * * *` (polling) | 「今日のひとこと」 API を call。 JST 時刻から slot 自動判定 (06-12=morning / 12-18=noon / 18-24=night / 00-06=skip)、 API 冪等性で既存 slot は HTTP 200 skipped、 各 slot 最終 30 分 (11:30/17:30/23:30 JST) は `is_backfill=true` で失敗時 email 通知。 **RPi5 cron が同一 endpoint を redundant に call** (GHA scheduler 障害時の fallback) |
 | `member-request.yml` | `repository_dispatch: member-request` | サイトからの入会申請を受けて、 private repo (minami-baseball-ob) に `config/members/<uid>.yml` を追加する PR を App token で作成。 申請時点の氏名 (`display_name`) を書くのもこの workflow |
 | `sync-roles.yml` | `*/5 * * * *` + dispatch (`sync-roles`) | private repo の `config/members/*.yml` (per-uid) と `config/members.yml` (手編集 allowlist) を統合して読み、 Supabase `user_roles` の `role` / `graduation_class` を同期 |
