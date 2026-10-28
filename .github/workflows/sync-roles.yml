@@ -72,7 +72,7 @@ jobs:
           set -euo pipefail
           mkdir -p config
           # runner からの一時的なネットワーク断 (dial tcp i/o timeout 等) が 1 回出ただけで
-          # ジョブを fail させない (= 失敗メールを飛ばさない)。404 (rc=44) だけは即確定。
+          # ジョブを fail させない (= 失敗メールを飛ばさない)。404 (rc=44) は 4 回続いたときだけ確定。
           api_retry() {
             local out="$1"; shift
             local i err="${RUNNER_TEMP}/apierr.txt"
@@ -80,10 +80,13 @@ jobs:
               if gh api "$@" > "$out" 2> "$err"; then
                 return 0
               fi
+              # 404 も一時的に返ることがある (2026-10-28 06:40Z、members.yml が 1 回だけ 404)。
+              # 4 回とも 404 のときだけ「無い」と確定する。
               if grep -qi "HTTP 404" "$err"; then
-                return 44
+                [ "$i" = 4 ] && return 44
               fi
               echo "api attempt ${i} failed: $(head -c 200 "$err")" >&2
+              [ "$i" = 4 ] && break
               sleep $((i * 10))
             done
             return 1
