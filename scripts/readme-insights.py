@@ -103,6 +103,11 @@ def check(data):
         if not isinstance(p.get("label"), str) or not p["label"]:
             raise GateError(f"分類名が空: {p!r}")
         nonneg_int(p["value"], "value")
+    for k, key in (("channels", lambda p: p["label"]), ("devices", lambda p: p["label"]),
+                   ("monthlyChannels", lambda p: (p.get("month"), p["label"]))):
+        keys = [key(p) for p in data[k]]
+        if len(keys) != len(set(keys)):
+            raise GateError(f"{k} に同じ分類の行が 2 回ある")
     csum = sum(p["value"] for p in data["channels"])
     if csum == 0:
         raise GateError("直近30日の参照元がすべて 0")
@@ -127,9 +132,14 @@ def check(data):
 
 def close_enough(part_sum, total):
     """参照元ごとの和とセッション合計の突き合わせ。
-    途中で参照元が変わった訪問は両方の参照元に数えられるので、完全には一致しない
-    （2026-10-08 実測: 232 対 231、60 対 59。8・9 月は一致）。数件のずれだけ許す。"""
-    return abs(part_sum - total) <= max(2, 0.02 * total)
+    途中で参照元が変わった訪問は両方の参照元に数えられるので、和は合計より多くなりうる
+    （2026-10-08 実測: 232 対 231、60 対 59。2026-11-08: 321 対 314 で 2% を超えて止まった）。
+    ずれはいつも「和のほうが多い」向き＝多い側は 5%（月はじめの小さい月は 3 件）まで許す。
+    少ない側は参照元の取りこぼしなので、数件（2%）だけ許す。
+    同じ参照元の行が 2 回ある壊れ方は、ここでなく check() のラベル重複の検査で止める。"""
+    if part_sum >= total:
+        return part_sum - total <= max(3, 0.05 * total)
+    return total - part_sum <= max(2, 0.02 * total)
 
 
 def shares(rows):
