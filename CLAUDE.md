@@ -11,12 +11,13 @@
 - 監視（`health-check.yml` / `scripts/`）は `yokohama-funnies-public-cron` に同じ写しがある＝**片方だけ直さない**。
 - `check-current-team.yml` は 2026-10-25 に削除（止めてあったが、サイト repo のコードを鍵つきで走らせる形だった。本番は private 側）。戻さない。
 - README の Workflows 表は自動では更新されない。workflow を足したら表も直す。
+- `sync-roles.yml` の `cron:` 行は **App（bot）が最後に書いた**（2026-11-10）。定期実行の失敗通知は cron 行を最後に書いた人に届くので、GitHub 側の障害（ジョブが 1 本も作られない失敗など）が人へのメールにならない。⛔ **cron 行を人の手で変えない**（変えると通知が人に戻る）。変えるときは `one-off-bot-owns-cron.yml`（使った後に削除・git 履歴にある）と同じ形で App に書かせる。本当の故障は `health-check.yml` が Issue とメールで知らせる。RPi5 からの 30 分おき起動は同日にやめた（RPi5 は止まることがある）＝監視の liveness は 14 時間。
 
 ## workflow
 | file | 起動 | 役割 |
 |---|---|---|
 | `member-request.yml` | `repository_dispatch` | 入会申請から private repo に `config/members/<uid>.yml` の PR を作り、`user_roles` の承認待ち行（氏名・期）を書く |
-| `sync-roles.yml` | 5 分おき・手動・dispatch | private repo の `config/members*.yml` を読んで role を同期。承認メールも |
+| `sync-roles.yml` | 10 分おき（実際に届くのは 1 日 3〜5 回）・手動・dispatch | private repo の `config/members*.yml` を読んで role を同期。承認メールも |
 | `health-check.yml` / `-ack.yml` | 毎時 / dispatch | 会員パイプラインの監視（異常時だけ private repo に Issue とメール） |
 | `daily-message.yml` | 30 分おき | 「今日のひとこと」の API を呼ぶ |
 | `keep-alive.yml` / `purge-deleted-photos.yml` / `warm-weather.yml` | 週 1 / 毎日 / 30 分おき | 休止防止 / 論理削除 7 日後の物理削除 / 天気キャッシュ |
