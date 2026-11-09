@@ -19,8 +19,9 @@ BAD = {"failure", "cancelled", "timed_out", "startup_failure"}
 MAX_AGE_SEC = 93600
 # cron 定期実行ワークフローの liveness しきい値 (秒)。直近 run がこれより古ければ「停止」とみなす。
 # member-request は申請時しか走らない event-driven なので対象外。
-# GitHub は */15 cron を実際は ~4h に間引くため、stall 判定は 6h で誤検知を避ける
-LIVENESS = {"sync-roles.yml": 21600}
+# GitHub は定期実行を実際は 1 日 3〜5 回しか届けない（2026-11-04〜09 実測: 間隔 中央 6h・最大 10.4h）。
+# RPi5 からの 30 分おき起動は 2026-11-10 にやめたので、stall 判定は 14h で誤検知を避ける
+LIVENESS = {"sync-roles.yml": 50400}
 # ランナー未割当 (0 ステップ) を GitHub 側起因として通知抑制してよい上限 (秒)。
 # これを過ぎても復旧していなければ、原因が何であれ知らせるべきなので抑制しない。
 # (GitHub 障害が継続中なら actions_component_degraded 側が引き続き抑制する)
