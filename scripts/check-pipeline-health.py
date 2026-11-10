@@ -98,16 +98,40 @@ def superseded_in_queue(run):
     return data.get("total_count", 0) == 0 and not data.get("jobs")
 
 
+def zero_job_failure(run):
+    """ジョブが 1 本も作られないまま failure で終わった run なら True (= GitHub 側の障害)。
+    2026-11-09 18:10Z に sync-roles がこれで落ち、30 分後の回で回復したのに Issue とメールが飛んだ。
+    workflow ファイルの書き損じは startup_failure になるのでここには入らない。
+    job 一覧を取れなければ False (= 従来どおり異常として扱う)。"""
+    if run.get("conclusion") != "failure":
+        return False
+    try:
+        data = gh("/repos/%s/%s/actions/runs/%s/jobs?per_page=1" % (OWNER, PUB_REPO, run.get("id")), PROBE_TOKEN)
+    except Exception as e:
+        print("  ::warning::job 一覧の取得失敗 (%s) — failure を異常として扱います" % e)
+        return False
+    return data.get("total_count", 1) == 0 and not data.get("jobs")
+
+
 def latest_completed_run(wf):
     data = gh("/repos/%s/%s/actions/workflows/%s/runs?per_page=10" % (OWNER, PUB_REPO, wf), PROBE_TOKEN)
+    newest = None
     for run in data.get("workflow_runs", []):
         if run.get("status") != "completed":
             continue
+        if newest is None:
+            newest = run
         if superseded_in_queue(run):
             print("%s: run %s は順番待ち中に後続と入れ替わった cancelled (job なし) のため飛ばします" % (wf, run.get("id")))
             continue
+        # 定期実行で見回る workflow だけ: 次の回で取り戻せるので、GitHub 側でジョブが作られなかった失敗は飛ばす。
+        # 止まり続ければ liveness が知らせる。member-request は取り戻す仕組みが無いので飛ばさない。
+        if wf in LIVENESS and zero_job_failure(run):
+            print("%s: run %s はジョブが 1 本も作られずに失敗した (GitHub 側) ため飛ばします" % (wf, run.get("id")))
+            continue
         return run
-    return None
+    # 直近 10 回がすべて飛ばす対象なら、何も走っていないのと同じ = 最新の回をそのまま判定に回す
+    return newest
 
 
 def send_email(subject, issue_url):
