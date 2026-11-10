@@ -95,15 +95,17 @@ def superseded_in_queue(run):
     except Exception as e:
         print("  ::warning::job 一覧の取得失敗 (%s) — cancelled を異常として扱います" % e)
         return False
-    return data.get("total_count", 0) == 0 and not data.get("jobs")
+    return data.get("total_count", 1) == 0 and not data.get("jobs")
 
 
-def zero_job_failure(run):
-    """ジョブが 1 本も作られないまま failure で終わった run なら True (= GitHub 側の障害)。
-    2026-11-09 18:10Z に sync-roles がこれで落ち、30 分後の回で回復したのに Issue とメールが飛んだ。
-    workflow ファイルの書き損じは startup_failure になるのでここには入らない。
+def zero_job_failure(run, ok_shas):
+    """ジョブが 1 本も作られないまま failure で終わり、同じ commit の run が成功している (= workflow ファイルは
+    正しい) なら True (= GitHub 側の障害)。2026-11-09 18:10Z に sync-roles がこれで落ち、30 分後の回で回復
+    したのに Issue とメールが飛んだ。
+    ⚠️ workflow ファイルの書き損じ (YAML の誤り) も「failure・ジョブ 0 本」になる (npb-prediction run
+    37744243411)。その commit では成功が 1 回も無いので ok_shas で区別し、すぐ知らせる。
     job 一覧を取れなければ False (= 従来どおり異常として扱う)。"""
-    if run.get("conclusion") != "failure":
+    if run.get("conclusion") != "failure" or run.get("head_sha") not in ok_shas:
         return False
     try:
         data = gh("/repos/%s/%s/actions/runs/%s/jobs?per_page=1" % (OWNER, PUB_REPO, run.get("id")), PROBE_TOKEN)
@@ -115,8 +117,10 @@ def zero_job_failure(run):
 
 def latest_completed_run(wf):
     data = gh("/repos/%s/%s/actions/workflows/%s/runs?per_page=10" % (OWNER, PUB_REPO, wf), PROBE_TOKEN)
+    runs = data.get("workflow_runs", [])
+    ok_shas = {r.get("head_sha") for r in runs if r.get("conclusion") == "success"}
     newest = None
-    for run in data.get("workflow_runs", []):
+    for run in runs:
         if run.get("status") != "completed":
             continue
         if newest is None:
@@ -126,7 +130,7 @@ def latest_completed_run(wf):
             continue
         # 定期実行で見回る workflow だけ: 次の回で取り戻せるので、GitHub 側でジョブが作られなかった失敗は飛ばす。
         # 止まり続ければ liveness が知らせる。member-request は取り戻す仕組みが無いので飛ばさない。
-        if wf in LIVENESS and zero_job_failure(run):
+        if wf in LIVENESS and zero_job_failure(run, ok_shas):
             print("%s: run %s はジョブが 1 本も作られずに失敗した (GitHub 側) ため飛ばします" % (wf, run.get("id")))
             continue
         return run
