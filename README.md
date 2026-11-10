@@ -17,10 +17,11 @@
 | `purge-deleted-photos.yml` | `0 19 * * *` (毎日 JST 4:00) + dispatch | soft-delete >7日の photos を Supabase Storage+DB から物理削除 + content テーブル purge (2026-05-30 private repo から移行) |
 | `daily-message.yml` | `*/30 * * * *` (polling) | 「今日のひとこと」 API を call。 JST 時刻から slot 自動判定 (06-12=morning / 12-18=noon / 18-24=night / 00-06=skip)、 API 冪等性で既存 slot は HTTP 200 skipped、 各 slot 最終 30 分 (11:30/17:30/23:30 JST) は `is_backfill=true` で失敗時 email 通知。 **RPi5 cron が同一 endpoint を redundant に call** (GHA scheduler 障害時の fallback) |
 | `member-request.yml` | `repository_dispatch: member-request` | サイトからの入会申請を受けて、 private repo (minami-baseball-ob) に `config/members/<uid>.yml` を追加する PR を App token で作成。 申請時点の氏名 (`display_name`) を書くのもこの workflow |
-| `sync-roles.yml` | `*/10 * * * *` + dispatch (`sync-roles`) | private repo の `config/members/*.yml` (per-uid) と `config/members.yml` (手編集 allowlist) を統合して読み、 Supabase `user_roles` の `role` / `graduation_class` を同期 |
+| `sync-roles.yml` | `*/10 * * * *` + dispatch (`sync-roles`) | private repo の `config/members/*.yml` (per-uid) と `config/members.yml` (手編集 allowlist) を統合して読み、 Supabase `user_roles` の `role` / `graduation_class` を同期。 **cron 行は App（bot）が書いたもの＝人の手で変えない**（定期実行の失敗通知は cron 行を最後に書いた人に届く・2026-11-10）。 定期実行の回で job `keep-enabled` が自分を有効化し直す（60 日停止の回避） |
 | `health-check.yml` | `7 * * * *` + dispatch | 上 2 本 (会員パイプライン) の死活監視。 Vercel proxy → GAS → `repository_dispatch` の往復と GAS heartbeat の鮮度を検査し、 異常時のみ private repo に追跡 issue + メール。 **一過性 (proxy 5xx / Actions 障害 / GAS トリガー遅延) では通知しない** — 詳細は各ステップのコメント |
 | `health-check-ack.yml` | `repository_dispatch: health-check, gas-heartbeat` | 上の往復の応答側。 GAS が打ち返した dispatch を受けて run を残すだけ (probe はこの run の `created_at` を見る) |
 | `update-readme-stats.yml` | `0 0 1 * *` (毎月1日 09:00 JST) | minami-baseball-ob を `DOCS_SYNC_PAT` で checkout して file/Supabase 計測、 3 repo (minami-baseball-ob / minami-baseball-ob-docs / yasumorishima profile) の `<!--stat:KEY-->...<!--/stat-->` と `<!--ob:KEY-->...<!--/ob-->` marker を auto-update |
+| `update-readme-insights.yml` | `17 21 * * *` (毎日 JST 6:17) + dispatch | 両サイトの `/api/insights-summary`（GA4 集計）から参照元の割合と図を作り、 公開 docs 2 repo（yokohama-funnies-docs / minami-baseball-ob-docs）の README を更新（`scripts/readme-insights.py`）。 参照元の和とセッション合計の検算は、 和が多い側は 2 倍（小さい月は合計＋3 件）まで通す（GA4 の sessions は HLL++ の推定値）・取りこぼし 2% と重複行は止める |
 
 全 `runs-on: ubuntu-latest` で public 無料枠運用。
 
