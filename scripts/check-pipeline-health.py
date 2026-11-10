@@ -19,8 +19,9 @@ BAD = {"failure", "cancelled", "timed_out", "startup_failure"}
 MAX_AGE_SEC = 93600
 # cron 定期実行ワークフローの liveness しきい値 (秒)。直近 run がこれより古ければ「停止」とみなす。
 # member-request は申請時しか走らない event-driven なので対象外。
-# GitHub は */15 cron を実際は ~4h に間引くため、stall 判定は 6h で誤検知を避ける
-LIVENESS = {"sync-roles.yml": 21600}
+# GitHub は定期実行を実際は 1 日 3〜5 回しか届けない（2026-11-04〜09 実測: 間隔 中央 6h・最大 10.4h）。
+# RPi5 からの 30 分おき起動は 2026-11-10 にやめたので、stall 判定は 14h で誤検知を避ける
+LIVENESS = {"sync-roles.yml": 50400}
 # ランナー未割当 (0 ステップ) を GitHub 側起因として通知抑制してよい上限 (秒)。
 # これを過ぎても復旧していなければ、原因が何であれ知らせるべきなので抑制しない。
 # (GitHub 障害が継続中なら actions_component_degraded 側が引き続き抑制する)
@@ -94,19 +95,47 @@ def superseded_in_queue(run):
     except Exception as e:
         print("  ::warning::job 一覧の取得失敗 (%s) — cancelled を異常として扱います" % e)
         return False
-    return data.get("total_count", 0) == 0 and not data.get("jobs")
+    return data.get("total_count", 1) == 0 and not data.get("jobs")
+
+
+def zero_job_failure(run, ok_shas):
+    """ジョブが 1 本も作られないまま failure で終わり、同じ commit の run が成功している (= workflow ファイルは
+    正しい) なら True (= GitHub 側の障害)。2026-11-09 18:10Z に sync-roles がこれで落ち、30 分後の回で回復
+    したのに Issue とメールが飛んだ。
+    ⚠️ workflow ファイルの書き損じ (YAML の誤り) も「failure・ジョブ 0 本」になる (npb-prediction run
+    37744243411)。その commit では成功が 1 回も無いので ok_shas で区別し、すぐ知らせる。
+    job 一覧を取れなければ False (= 従来どおり異常として扱う)。"""
+    if run.get("conclusion") != "failure" or run.get("head_sha") not in ok_shas:
+        return False
+    try:
+        data = gh("/repos/%s/%s/actions/runs/%s/jobs?per_page=1" % (OWNER, PUB_REPO, run.get("id")), PROBE_TOKEN)
+    except Exception as e:
+        print("  ::warning::job 一覧の取得失敗 (%s) — failure を異常として扱います" % e)
+        return False
+    return data.get("total_count", 1) == 0 and not data.get("jobs")
 
 
 def latest_completed_run(wf):
     data = gh("/repos/%s/%s/actions/workflows/%s/runs?per_page=10" % (OWNER, PUB_REPO, wf), PROBE_TOKEN)
-    for run in data.get("workflow_runs", []):
+    runs = data.get("workflow_runs", [])
+    ok_shas = {r.get("head_sha") for r in runs if r.get("conclusion") == "success"}
+    newest = None
+    for run in runs:
         if run.get("status") != "completed":
             continue
+        if newest is None:
+            newest = run
         if superseded_in_queue(run):
             print("%s: run %s は順番待ち中に後続と入れ替わった cancelled (job なし) のため飛ばします" % (wf, run.get("id")))
             continue
+        # 定期実行で見回る workflow だけ: 次の回で取り戻せるので、GitHub 側でジョブが作られなかった失敗は飛ばす。
+        # 止まり続ければ liveness が知らせる。member-request は取り戻す仕組みが無いので飛ばさない。
+        if wf in LIVENESS and zero_job_failure(run, ok_shas):
+            print("%s: run %s はジョブが 1 本も作られずに失敗した (GitHub 側) ため飛ばします" % (wf, run.get("id")))
+            continue
         return run
-    return None
+    # 直近 10 回がすべて飛ばす対象なら、何も走っていないのと同じ = 最新の回をそのまま判定に回す
+    return newest
 
 
 def send_email(subject, issue_url):

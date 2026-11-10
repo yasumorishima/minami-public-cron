@@ -1,0 +1,78 @@
+name: One-off bot owns sync-roles cron
+
+# 定期実行の失敗通知は「cron 行を最後に書き換えた人」に届く（GitHub Docs: events that trigger workflows / schedule）。
+# ここで App（bot）が sync-roles.yml の cron 行を書き直し、GitHub 側の障害でジョブが 1 本も作られない失敗などが
+# 人へのメールにならないようにする。本当の故障は health-check が Issue とメールで知らせる。
+# 1 回走らせて App の commit を確かめたら、このファイルは消す。
+
+on:
+  workflow_dispatch:
+    inputs:
+      memo:
+        description: "実行メモ"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: one-off-bot-owns-cron
+  cancel-in-progress: false
+
+jobs:
+  rewrite:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint App token (this repo only, contents + workflows)
+        id: app
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-workflows: write
+
+      - name: Rewrite the cron line as the App
+        id: put
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+          WF: .github/workflows/sync-roles.yml
+          OLD: '    - cron: "*/5 * * * *"'
+          NEW: '    - cron: "*/10 * * * *"'
+        run: |
+          set -euo pipefail
+          meta=$(gh api "repos/$REPO/contents/$WF?ref=main")
+          sha=$(jq -r .sha <<<"$meta")
+          jq -r .content <<<"$meta" | base64 -d > before.yml
+          python3 -I - <<'PY'
+          import os
+          s = open("before.yml", newline="").read()
+          old, new = os.environ["OLD"] + "\n", os.environ["NEW"] + "\n"
+          if s.count(old) != 1 or "\r" in s:
+              raise SystemExit(f"expected exactly one LF line {old!r}; found {s.count(old)} (CR present: {chr(13) in s})")
+          open("after.yml", "w", newline="").write(s.replace(old, new))
+          PY
+          # 変わるのは cron の 1 行だけ
+          changed=$(diff before.yml after.yml | grep -c '^[<>]' || true)
+          [ "$changed" = 2 ] || { echo "::error::diff touches $changed lines (expected 2)"; diff before.yml after.yml; exit 1; }
+          commit=$(gh api -X PUT "repos/$REPO/contents/$WF" \
+            -f message="sync-roles: cron 行を App が書き直す（定期実行の失敗通知を人に飛ばさない）" \
+            -f content="$(base64 -w0 after.yml)" -f sha="$sha" -f branch=main --jq '.commit.sha')
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the App is now the last writer of the cron line
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+          WF: .github/workflows/sync-roles.yml
+          COMMIT: ${{ steps.put.outputs.commit }}
+          WANT: ${{ steps.app.outputs.app-slug }}[bot]
+        run: |
+          set -euo pipefail
+          got=$(gh api "repos/$REPO/commits?path=$WF&sha=main&per_page=1" --jq '.[0].sha + " " + .[0].author.login')
+          echo "last commit on $WF: $got (want $COMMIT $WANT)"
+          [ "$got" = "$COMMIT $WANT" ] || { echo "::error::last writer of $WF is not the App commit"; exit 1; }
+          gh api "repos/$REPO/contents/$WF?ref=main" --jq .content | base64 -d | grep -n 'cron:'

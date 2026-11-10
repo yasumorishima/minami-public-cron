@@ -339,3 +339,28 @@ jobs:
               print("::error::role sync は途中で中断しました (通知の送信は完了しています)。")
               raise _sync_error
           PYTHON
+
+  keep-enabled:
+    # GitHub は 60 日 push の無い repo の定期実行を止める。止まった後に人が有効化し直すと、
+    # 定期実行の失敗通知がその人に戻る（cron 行は App が書いた＝通知が人に飛ばない状態を保つため）。
+    # ここで GITHUB_TOKEN（github-actions[bot]）が自分を有効化し直して timer を戻す。
+    # oss-contributions の schedule-keepalive はこのファイルを対象から外している。
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Keep this workflow enabled
+        # 一時的な失敗で run を failure にしない（監視がメールを出すため）。本当に止まれば liveness（14h）が知らせる。
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          for i in 1 2 3; do
+            gh api -X PUT "repos/$REPO/actions/workflows/sync-roles.yml/enable" && exit 0
+            echo "enable attempt $i failed; retrying" >&2
+            sleep $((i * 10))
+          done
+          echo "::warning::sync-roles.yml の enable を 3 回試して失敗（次の定期実行でまた試す）"
+          exit 1
