@@ -351,6 +351,16 @@ jobs:
       actions: write
     steps:
       - name: Keep this workflow enabled
+        # 一時的な失敗で run を failure にしない（監視がメールを出すため）。本当に止まれば liveness（14h）が知らせる。
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/sync-roles.yml/enable"
+          REPO: ${{ github.repository }}
+        run: |
+          for i in 1 2 3; do
+            gh api -X PUT "repos/$REPO/actions/workflows/sync-roles.yml/enable" && exit 0
+            echo "enable attempt $i failed; retrying" >&2
+            sleep $((i * 10))
+          done
+          echo "::warning::sync-roles.yml の enable を 3 回試して失敗（次の定期実行でまた試す）"
+          exit 1
